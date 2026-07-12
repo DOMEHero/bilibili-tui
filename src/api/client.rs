@@ -7,6 +7,7 @@ use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::io::Write;
 use std::sync::RwLock;
 
@@ -543,6 +544,32 @@ impl ApiClient {
         }
         resp.data
             .ok_or_else(|| anyhow!("playurl response has no data"))
+    }
+
+    pub async fn get_video_danmaku(&self, cid: i64) -> Result<Vec<super::danmaku::VideoDanmaku>> {
+        let url = format!("https://comment.bilibili.com/{cid}.xml");
+        let response = self.client.get(&url).send().await?.error_for_status()?;
+        let encoding = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let bytes = response.bytes().await?;
+        let body = if encoding.contains("deflate") {
+            let mut decoded = Vec::new();
+            if flate2::read::DeflateDecoder::new(bytes.as_ref())
+                .read_to_end(&mut decoded)
+                .is_err()
+            {
+                decoded.clear();
+                flate2::read::ZlibDecoder::new(bytes.as_ref()).read_to_end(&mut decoded)?;
+            }
+            String::from_utf8(decoded)?
+        } else {
+            String::from_utf8(bytes.to_vec())?
+        };
+        super::danmaku::parse_xml(&body)
     }
 
     /// Load the public profile shown at space.bilibili.com/{mid}.

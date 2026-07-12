@@ -116,6 +116,7 @@ impl App {
                     duration,
                     None,
                     self.credentials.as_ref(),
+                    self.config.danmaku.clone(),
                     self.playback_event_tx.clone(),
                     session_id,
                 )
@@ -151,6 +152,7 @@ impl App {
                         page.duration,
                         Some(page.page),
                         self.credentials.as_ref(),
+                        self.config.danmaku.clone(),
                         self.playback_event_tx.clone(),
                         session_id,
                     )

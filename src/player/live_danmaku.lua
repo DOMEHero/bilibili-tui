@@ -95,6 +95,9 @@ local function render()
         overlay:update()
         return
     end
+    if #active == 0 and #pending == 0 and overlay.data == "" then
+        return
+    end
 
     local now = mp.get_time()
     local font_size, lane_height, top, lanes = schedule(width, height, now)
@@ -123,14 +126,26 @@ local function render()
     overlay:update()
 end
 
-local function on_danmaku(payload)
-    local message = utils.parse_json(payload or "")
+local function enqueue_message(message)
     if type(message) ~= "table" or type(message.text) ~= "string" then return end
     local text = message.text:gsub("[\r\n]", " ")
     if text == "" then return end
     pending[#pending + 1] = { text = text, color = message.color }
     while #pending > MAX_PENDING do table.remove(pending, 1) end
-    render()
+end
+
+local function on_danmaku(payload)
+    if not config.enabled then return end
+    enqueue_message(utils.parse_json(payload or ""))
+end
+
+local function on_danmaku_batch(payload)
+    if not config.enabled then return end
+    local messages = utils.parse_json(payload or "")
+    if type(messages) ~= "table" then return end
+    for _, message in ipairs(messages) do
+        enqueue_message(message)
+    end
 end
 
 local function on_config(payload)
@@ -151,12 +166,17 @@ local function on_config(payload)
 end
 
 mp.register_script_message("danmaku", on_danmaku)
+mp.register_script_message("danmaku-batch", on_danmaku_batch)
 mp.register_script_message("danmaku-config", on_config)
--- Start only after MPV reports the real display refresh rate. Use the exact
--- value and follow it if the window moves to another display.
+-- Start only after MPV reports the real display refresh rate, and recompute if
+-- the window moves to another display. The video remains in audio-sync mode;
+-- only the OSD cadence follows the display.
 local function apply_display_fps(value)
-    local fps = tonumber(value)
-    if fps == nil or fps <= 0 then return false end
+    local display_fps = tonumber(value)
+    if display_fps == nil or display_fps <= 0 then return false end
+    -- Follow the actual display refresh rate exactly; the video source is
+    -- still untouched and only the OSD danmaku is updated at this cadence.
+    local fps = display_fps
     if refresh_timer == nil then
         refresh_timer = mp.add_periodic_timer(1 / fps, render)
     else

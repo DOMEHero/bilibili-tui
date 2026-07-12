@@ -3,6 +3,7 @@ pub mod bangumi;
 pub mod cdn;
 pub mod client;
 pub mod comment;
+pub mod danmaku;
 pub mod dynamic;
 pub mod favorite;
 pub mod heartbeat;
