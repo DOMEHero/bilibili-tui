@@ -10,22 +10,31 @@ const SOURCES: [&str; 2] = [
     "https://gist.githubusercontent.com/maguowei/20a39ed03b43b87704c47c517064e3d7/raw/bilibili.snd.sgmodule",
     "https://raw.githubusercontent.com/BiliUniverse/Redirect/main/src/function/database.mjs",
 ];
-const DOMESTIC: [&str; 10] = [
+// PiliPlus keeps this list as its user-selectable Bilibili CDN catalog.  Keep
+// the complete set locally so ranking is not dependent on a third-party
+// catalog fetch succeeding.
+const PILIPLUS_DOMESTIC: [&str; 14] = [
     "upos-sz-mirrorali.bilivideo.com",
-    "upos-sz-mirrorali02.bilivideo.com",
-    "upos-sz-mirrorbos.bilivideo.com",
+    "upos-sz-mirroralib.bilivideo.com",
+    "upos-sz-mirroralio1.bilivideo.com",
     "upos-sz-mirrorcos.bilivideo.com",
+    "upos-sz-mirrorcosb.bilivideo.com",
+    "upos-sz-mirrorcoso1.bilivideo.com",
     "upos-sz-mirrorhw.bilivideo.com",
-    "upos-sz-mirrorks3.bilivideo.com",
-    "upos-sz-mirrorkodo.bilivideo.com",
-    "upos-sz-mirrorwcs.bilivideo.com",
-    "upos-sz-mirrorxycdn.bilivideo.com",
-    "upos-sz-upcdntx.bilivideo.com",
+    "upos-sz-mirrorhwb.bilivideo.com",
+    "upos-sz-mirrorhwo1.bilivideo.com",
+    "upos-sz-mirror08c.bilivideo.com",
+    "upos-sz-mirror08h.bilivideo.com",
+    "upos-sz-mirror08ct.bilivideo.com",
+    "upos-tf-all-hw.bilivideo.com",
+    "upos-tf-all-tx.bilivideo.com",
 ];
-const OVERSEAS: [&str; 3] = [
+const PILIPLUS_OVERSEAS: [&str; 5] = [
     "upos-hz-mirrorakam.akamaized.net",
-    "upos-sz-mirrorasiaov.bilibilivideo.com",
+    "upos-sz-mirroraliov.bilivideo.com",
     "upos-sz-mirrorcosov.bilivideo.com",
+    "upos-sz-mirrorhwov.bilivideo.com",
+    "cn-hk-eq-bcache-01.bilivideo.com",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +97,7 @@ fn extract_hosts(text: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 pub(super) fn is_overseas_host(host: &str) -> bool {
-    host.contains("akamaized") || host.contains("asiaov") || host.contains("cosov")
+    PILIPLUS_OVERSEAS.contains(&host)
 }
 
 async fn detect_region(client: &Client) -> Option<Region> {
@@ -133,18 +142,19 @@ async fn fetch_catalog(client: &Client, source: &str) -> Option<String> {
 pub(super) async fn regional_hosts(client: &Client) -> (Option<Region>, Vec<String>) {
     let now = chrono::Utc::now().timestamp();
     let mut cache = load_cache();
+    let mut hosts = BTreeSet::new();
+    hosts.extend(PILIPLUS_DOMESTIC.into_iter().map(str::to_string));
+    hosts.extend(PILIPLUS_OVERSEAS.into_iter().map(str::to_string));
+    hosts.extend(cache.hosts.iter().cloned());
     if now - cache.updated_at >= REFRESH_SECS || cache.hosts.is_empty() {
-        let mut hosts = BTreeSet::new();
-        hosts.extend(DOMESTIC.into_iter().map(str::to_string));
-        hosts.extend(OVERSEAS.into_iter().map(str::to_string));
         for source in SOURCES {
             if let Some(text) = fetch_catalog(client, source).await {
                 hosts.extend(extract_hosts(&text));
             }
         }
-        cache.hosts = hosts.into_iter().collect();
         cache.updated_at = now;
     }
+    cache.hosts = hosts.into_iter().collect();
     if (now - cache.region_updated_at >= REFRESH_SECS || cache.region.is_none())
         && let Some(region) = detect_region(client).await
     {
@@ -170,6 +180,8 @@ mod tests {
         assert_eq!(hosts.len(), 2);
         assert!(!is_overseas_host(&hosts[0]));
         assert!(is_overseas_host(&hosts[1]));
+        assert!(is_overseas_host("upos-sz-mirrorhwov.bilivideo.com"));
+        assert!(is_overseas_host("cn-hk-eq-bcache-01.bilivideo.com"));
         assert_eq!(extract_hosts("proxy-evilakamaized.net").count(), 0);
     }
 
