@@ -39,7 +39,19 @@ pub enum PlaybackStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaybackEvent {
-    Finished { bvid: String },
+    ItemChanged {
+        session_id: u64,
+        index: usize,
+        bvid: String,
+    },
+    Finished {
+        session_id: u64,
+        bvid: Option<String>,
+    },
+    Failed {
+        session_id: u64,
+        error: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +62,7 @@ pub struct PlaybackState {
     pub source: Option<PlaylistSource>,
     pub status: PlaybackStatus,
     pub last_error: Option<String>,
+    pub session_id: Option<u64>,
 }
 
 impl PlaybackState {
@@ -59,6 +72,47 @@ impl PlaybackState {
         self.current_index = (!self.queue.is_empty()).then_some(0);
         self.status = PlaybackStatus::Idle;
         self.last_error = None;
+        self.session_id = None;
+    }
+
+    pub fn begin_session(&mut self, session_id: u64) {
+        self.session_id = Some(session_id);
+        self.status = PlaybackStatus::Playing;
+        self.last_error = None;
+    }
+
+    pub fn apply_event(&mut self, event: &PlaybackEvent) -> bool {
+        let session_id = match event {
+            PlaybackEvent::ItemChanged { session_id, .. }
+            | PlaybackEvent::Finished { session_id, .. }
+            | PlaybackEvent::Failed { session_id, .. } => *session_id,
+        };
+        if self.session_id != Some(session_id) {
+            return false;
+        }
+        match event {
+            PlaybackEvent::ItemChanged { index, bvid, .. } => {
+                self.current_index = if self
+                    .queue
+                    .get(*index)
+                    .is_some_and(|item| item.bvid == *bvid)
+                {
+                    Some(*index)
+                } else {
+                    self.queue.iter().position(|item| item.bvid == *bvid)
+                };
+            }
+            PlaybackEvent::Finished { .. } => {
+                self.status = PlaybackStatus::Finished;
+                self.session_id = None;
+            }
+            PlaybackEvent::Failed { error, .. } => {
+                self.status = PlaybackStatus::Failed;
+                self.last_error = Some(error.clone());
+                self.session_id = None;
+            }
+        }
+        true
     }
 
     pub fn play_from(&mut self, index: usize) -> bool {
@@ -80,7 +134,9 @@ impl PlaybackState {
                 .checked_add(1)
                 .filter(|next| *next < self.queue.len()),
             PlayOrder::Reverse => current.checked_sub(1),
-            PlayOrder::Shuffle => None,
+            PlayOrder::Shuffle => current
+                .checked_add(1)
+                .filter(|next| *next < self.queue.len()),
         };
         if let Some(next) = next {
             self.current_index = Some(next);
@@ -136,5 +192,47 @@ mod tests {
         state.replace_queue(PlaylistSource::Manual, vec![item(1)]);
         assert!(!state.play_from(1));
         assert_eq!(state.current_index, Some(0));
+    }
+
+    #[test]
+    fn ignores_events_from_an_old_session() {
+        let mut state = PlaybackState::default();
+        state.replace_queue(PlaylistSource::Manual, vec![item(1), item(2)]);
+        state.begin_session(2);
+        assert!(!state.apply_event(&PlaybackEvent::Finished {
+            session_id: 1,
+            bvid: None
+        }));
+        assert_eq!(state.status, PlaybackStatus::Playing);
+        assert!(state.apply_event(&PlaybackEvent::ItemChanged {
+            session_id: 2,
+            index: 1,
+            bvid: "BV2".into()
+        }));
+        assert_eq!(state.current_index, Some(1));
+    }
+
+    #[test]
+    fn failed_player_marks_active_session_failed() {
+        let mut state = PlaybackState::default();
+        state.replace_queue(PlaylistSource::Manual, vec![item(1)]);
+        state.begin_session(7);
+        assert!(state.apply_event(&PlaybackEvent::Failed {
+            session_id: 7,
+            error: "decoder failed".into(),
+        }));
+        assert_eq!(state.status, PlaybackStatus::Failed);
+        assert_eq!(state.last_error.as_deref(), Some("decoder failed"));
+        assert_eq!(state.session_id, None);
+    }
+
+    #[test]
+    fn shuffled_queue_advances_in_its_materialized_order() {
+        let mut state = PlaybackState::default();
+        state.replace_queue(PlaylistSource::Manual, vec![item(1), item(2)]);
+        state.order = PlayOrder::Shuffle;
+        assert!(state.advance());
+        assert_eq!(state.current_index, Some(1));
+        assert!(!state.advance());
     }
 }

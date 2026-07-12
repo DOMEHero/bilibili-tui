@@ -233,15 +233,42 @@ impl App {
 
     pub(super) async fn tick(&mut self) {
         self.drain_network_events();
+        if let Some((items, source, start_index, order)) = self.pending_playlist.take() {
+            self.start_playlist(items, source, start_index, order).await;
+        }
         while let Ok(event) = self.playback_event_rx.try_recv() {
-            let crate::domain::playback::PlaybackEvent::Finished { bvid } = event;
-            self.playback.status = crate::domain::playback::PlaybackStatus::Finished;
-            if self.auto_return_after_playback.as_deref() == Some(&bvid)
-                && matches!(&self.current_page, Page::VideoDetail(page) if page.bvid == bvid)
-            {
-                self.auto_return_after_playback = None;
-                self.handle_action(crate::application::AppAction::BackToList)
-                    .await;
+            let accepted = self.playback.apply_event(&event);
+            match event {
+                crate::domain::playback::PlaybackEvent::Finished {
+                    session_id,
+                    bvid: Some(bvid),
+                } => {
+                    if accepted
+                        && self.auto_return_after_playback.as_ref()
+                            == Some(&(session_id, bvid.clone()))
+                        && matches!(&self.current_page, Page::VideoDetail(page) if page.bvid == bvid)
+                    {
+                        self.auto_return_after_playback = None;
+                        self.handle_action(crate::application::AppAction::BackToList)
+                            .await;
+                    } else if self
+                        .auto_return_after_playback
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == session_id)
+                    {
+                        self.auto_return_after_playback = None;
+                    }
+                }
+                crate::domain::playback::PlaybackEvent::Failed { session_id, .. }
+                    if accepted
+                        && self
+                            .auto_return_after_playback
+                            .as_ref()
+                            .is_some_and(|(id, _)| *id == session_id) =>
+                {
+                    self.auto_return_after_playback = None;
+                }
+                _ => {}
             }
         }
 
@@ -256,8 +283,10 @@ impl App {
             None
         };
         if let Some((bvid, action)) = auto_play {
-            self.auto_return_after_playback = Some(bvid);
             self.handle_action(action).await;
+            if let Some(session_id) = self.playback.session_id {
+                self.auto_return_after_playback = Some((session_id, bvid));
+            }
         }
         match &mut self.current_page {
             Page::Login(page) => {

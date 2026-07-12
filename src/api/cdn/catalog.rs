@@ -1,8 +1,10 @@
+use futures_util::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const REFRESH_SECS: i64 = 24 * 60 * 60;
@@ -34,7 +36,7 @@ pub(super) enum Region {
     Overseas,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct CatalogCache {
     updated_at: i64,
@@ -42,6 +44,8 @@ struct CatalogCache {
     region: Option<Region>,
     hosts: Vec<String>,
 }
+
+static CATALOG_REFRESHING: AtomicBool = AtomicBool::new(false);
 
 fn cache_path() -> Option<PathBuf> {
     let mut path = dirs::config_dir()?;
@@ -76,9 +80,13 @@ fn extract_hosts(text: &str) -> impl Iterator<Item = String> + '_ {
     })
     .filter(|token| {
         (token.starts_with("upos-") || token.starts_with("proxy-"))
-            && (token.ends_with("bilivideo.com")
-                || token.ends_with("bilibilivideo.com")
-                || token.ends_with("akamaized.net"))
+            && ["bilivideo.com", "bilibilivideo.com", "akamaized.net"]
+                .iter()
+                .any(|suffix| {
+                    token
+                        .strip_suffix(suffix)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+                })
     })
     .map(str::to_ascii_lowercase)
 }
@@ -88,16 +96,18 @@ pub(super) fn is_overseas_host(host: &str) -> bool {
 }
 
 async fn detect_region(client: &Client) -> Option<Region> {
-    let value: serde_json::Value = client
-        .get("https://api.bilibili.com/x/web-interface/zone?jsonp=jsonp")
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let value: serde_json::Value = tokio::time::timeout(Duration::from_secs(5), async {
+        client
+            .get("https://api.bilibili.com/x/web-interface/zone?jsonp=jsonp")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    })
+    .await
+    .ok()?
+    .ok()?;
     let country_code = value.pointer("/data/country_code")?.as_i64()?;
     Some(if country_code == 86 {
         Region::MainlandChina
@@ -106,7 +116,25 @@ async fn detect_region(client: &Client) -> Option<Region> {
     })
 }
 
-pub(super) async fn regional_hosts(client: &Client) -> (Region, Vec<String>) {
+async fn fetch_catalog(client: &Client, source: &str) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut response = client.get(source).send().await?.error_for_status()?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                return Ok::<_, reqwest::Error>(None);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(String::from_utf8(body).ok())
+    })
+    .await
+    .ok()?
+    .ok()?
+}
+
+#[allow(dead_code)]
+pub(super) async fn regional_hosts(client: &Client) -> (Option<Region>, Vec<String>) {
     let now = chrono::Utc::now().timestamp();
     let mut cache = load_cache();
     if now - cache.updated_at >= REFRESH_SECS || cache.hosts.is_empty() {
@@ -114,11 +142,7 @@ pub(super) async fn regional_hosts(client: &Client) -> (Region, Vec<String>) {
         hosts.extend(DOMESTIC.into_iter().map(str::to_string));
         hosts.extend(OVERSEAS.into_iter().map(str::to_string));
         for source in SOURCES {
-            if let Ok(Ok(response)) =
-                tokio::time::timeout(Duration::from_secs(5), client.get(source).send()).await
-                && let Ok(response) = response.error_for_status()
-                && let Ok(text) = response.text().await
-            {
+            if let Some(text) = fetch_catalog(client, source).await {
                 hosts.extend(extract_hosts(&text));
             }
         }
@@ -131,17 +155,76 @@ pub(super) async fn regional_hosts(client: &Client) -> (Region, Vec<String>) {
         cache.region = Some(region);
         cache.region_updated_at = now;
     }
-    let region = cache.region.unwrap_or(Region::Overseas);
+    let region = cache.region;
     save_cache(&cache);
     let hosts = cache
         .hosts
         .into_iter()
         .filter(|host| match region {
-            Region::MainlandChina => !is_overseas_host(host),
-            Region::Overseas => is_overseas_host(host),
+            Some(Region::MainlandChina) => !is_overseas_host(host),
+            Some(Region::Overseas) => is_overseas_host(host),
+            None => true,
         })
         .collect();
     (region, hosts)
+}
+
+/// Resolve only the playback region without downloading the optional CDN
+/// catalog. Ranking uses API-authorized playurl hosts, so catalog refresh must
+/// not delay the playback hot path.
+pub(super) async fn playback_region(client: &Client) -> Option<Region> {
+    let now = chrono::Utc::now().timestamp();
+    let mut cache = load_cache();
+    if (now - cache.region_updated_at >= REFRESH_SECS || cache.region.is_none())
+        && let Some(region) = detect_region(client).await
+    {
+        cache.region = Some(region);
+        cache.region_updated_at = now;
+        save_cache(&cache);
+    }
+    let region = cache.region;
+    if (now - cache.updated_at >= REFRESH_SECS || cache.hosts.is_empty())
+        && CATALOG_REFRESHING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut latest = load_cache();
+            let mut hosts = BTreeSet::new();
+            hosts.extend(DOMESTIC.into_iter().map(str::to_string));
+            hosts.extend(OVERSEAS.into_iter().map(str::to_string));
+            for source in SOURCES {
+                if let Some(text) = fetch_catalog(&client, source).await {
+                    hosts.extend(extract_hosts(&text));
+                }
+            }
+            latest.hosts = hosts.into_iter().collect();
+            latest.updated_at = chrono::Utc::now().timestamp();
+            save_cache(&latest);
+            // Probe only the bare host: never attach a media path, cookie,
+            // signed query, or playurl token. Chunks bound network fan-out.
+            for hosts in latest.hosts.chunks(8) {
+                join_all(hosts.iter().cloned().map(|host| {
+                    let client = client.clone();
+                    async move {
+                        let started = std::time::Instant::now();
+                        let result = tokio::time::timeout(
+                            Duration::from_millis(1500),
+                            client.head(format!("https://{host}/")).send(),
+                        )
+                        .await;
+                        let latency = matches!(result, Ok(Ok(_))).then(|| started.elapsed());
+                        super::record_catalog_probe(&host, latency);
+                    }
+                }))
+                .await;
+            }
+            super::flush_catalog_probes();
+            CATALOG_REFRESHING.store(false, Ordering::Release);
+        });
+    }
+    region
 }
 
 #[cfg(test)]
@@ -156,5 +239,12 @@ mod tests {
         assert_eq!(hosts.len(), 2);
         assert!(!is_overseas_host(&hosts[0]));
         assert!(is_overseas_host(&hosts[1]));
+        assert_eq!(extract_hosts("proxy-evilakamaized.net").count(), 0);
+    }
+
+    #[test]
+    fn missing_region_remains_neutral() {
+        let cache = CatalogCache::default();
+        assert_eq!(cache.region, None);
     }
 }

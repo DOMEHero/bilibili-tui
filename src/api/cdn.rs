@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 mod catalog;
@@ -112,6 +113,9 @@ struct CdnHistory {
     audio_score: Option<f64>,
     audio_speed_ratio: Option<f64>,
     audio_bandwidth: Option<i64>,
+    catalog_reachable: Option<bool>,
+    catalog_latency_ms: Option<f64>,
+    catalog_probed_at: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -122,6 +126,14 @@ enum StreamKind {
 
 static CDN_SCORES: OnceLock<Mutex<HashMap<String, CachedScore>>> = OnceLock::new();
 static CDN_HISTORY: OnceLock<Mutex<HashMap<String, CdnHistory>>> = OnceLock::new();
+static CDN_HISTORY_BASE: OnceLock<HashMap<String, CdnHistory>> = OnceLock::new();
+struct HistoryWrite {
+    values: HashMap<String, CdnHistory>,
+    completed: Option<mpsc::SyncSender<bool>>,
+}
+
+static HISTORY_WRITER: OnceLock<mpsc::Sender<HistoryWrite>> = OnceLock::new();
+static HISTORY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn scores() -> &'static Mutex<HashMap<String, CachedScore>> {
     CDN_SCORES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -143,23 +155,157 @@ fn history_path() -> Option<PathBuf> {
 
 fn history() -> &'static Mutex<HashMap<String, CdnHistory>> {
     CDN_HISTORY.get_or_init(|| {
-        let values = history_path()
+        let values: HashMap<String, CdnHistory> = history_path()
             .and_then(|path| fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+        let _ = CDN_HISTORY_BASE.set(values.clone());
         Mutex::new(values)
     })
 }
 
-fn save_history(values: &HashMap<String, CdnHistory>) {
-    let Some(path) = history_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+fn write_history(
+    previous: &HashMap<String, CdnHistory>,
+    values: &HashMap<String, CdnHistory>,
+) -> bool {
+    let Some(path) = history_path() else {
+        return false;
+    };
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return false;
     }
-    if let Ok(bytes) = serde_json::to_vec_pretty(values) {
-        let temporary = path.with_extension("json.tmp");
+    let lock_path = path.with_extension("json.lock");
+    let mut lock = None;
+    for _ in 0..100 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => {
+                lock = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(30));
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return false,
+        }
+    }
+    let Some(_lock) = lock else { return false };
+    let mut merged: HashMap<String, CdnHistory> = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    for (host, value) in values {
+        let old = previous.get(host).cloned().unwrap_or_default();
+        let target = merged.entry(host.clone()).or_default();
+        target.attempts = target
+            .attempts
+            .saturating_add(value.attempts.saturating_sub(old.attempts));
+        target.corruptions = target
+            .corruptions
+            .saturating_add(value.corruptions.saturating_sub(old.corruptions));
+        target.probe_samples = target
+            .probe_samples
+            .saturating_add(value.probe_samples.saturating_sub(old.probe_samples));
+        target.probe_failures = target
+            .probe_failures
+            .saturating_add(value.probe_failures.saturating_sub(old.probe_failures));
+        if value.last_probed_at >= target.last_probed_at {
+            target.last_probe_ok = value.last_probe_ok;
+            target.latency_ms = value.latency_ms;
+            target.throughput_bps = value.throughput_bps;
+            target.last_probed_at = value.last_probed_at;
+            target.video_score = value.video_score;
+            target.video_speed_ratio = value.video_speed_ratio;
+            target.video_bandwidth = value.video_bandwidth;
+            target.audio_score = value.audio_score;
+            target.audio_speed_ratio = value.audio_speed_ratio;
+            target.audio_bandwidth = value.audio_bandwidth;
+        }
+        if value.catalog_probed_at >= target.catalog_probed_at {
+            target.catalog_reachable = value.catalog_reachable;
+            target.catalog_latency_ms = value.catalog_latency_ms;
+            target.catalog_probed_at = value.catalog_probed_at;
+        }
+    }
+    let success = if let Ok(bytes) = serde_json::to_vec_pretty(&merged) {
+        let sequence = HISTORY_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("json.{}.{sequence}.tmp", std::process::id()));
         if fs::write(&temporary, bytes).is_ok() {
-            let _ = fs::rename(temporary, path);
+            fs::rename(&temporary, &path).is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let _ = fs::remove_file(lock_path);
+    success
+}
+
+fn save_history(values: &HashMap<String, CdnHistory>) {
+    let sender = HISTORY_WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<HistoryWrite>();
+        std::thread::Builder::new()
+            .name("cdn-history-writer".into())
+            .spawn(move || {
+                let mut previous = CDN_HISTORY_BASE.get().cloned().unwrap_or_default();
+                while let Ok(mut pending) = rx.recv() {
+                    while pending.completed.is_none()
+                        && let Ok(newer) = rx.try_recv()
+                    {
+                        pending = newer;
+                    }
+                    let written = write_history(&previous, &pending.values);
+                    if written {
+                        previous = pending.values;
+                    }
+                    if let Some(completed) = pending.completed {
+                        let _ = completed.send(written);
+                    }
+                }
+            })
+            .expect("spawn CDN history writer");
+        tx
+    });
+    let _ = sender.send(HistoryWrite {
+        values: values.clone(),
+        completed: None,
+    });
+}
+
+fn save_history_durable(values: HashMap<String, CdnHistory>) {
+    let Some(sender) = HISTORY_WRITER.get().cloned().or_else(|| {
+        save_history(&values);
+        HISTORY_WRITER.get().cloned()
+    }) else {
+        return;
+    };
+    for _ in 0..3 {
+        let (completed_tx, completed_rx) = mpsc::sync_channel(0);
+        if sender
+            .send(HistoryWrite {
+                values: values.clone(),
+                completed: Some(completed_tx),
+            })
+            .is_err()
+        {
+            return;
+        }
+        if completed_rx.recv_timeout(Duration::from_secs(2)) == Ok(true) {
+            return;
         }
     }
 }
@@ -188,6 +334,34 @@ fn record_probe_failure(host: &str) {
     }
 }
 
+fn record_catalog_probe(host: &str, latency: Option<Duration>) {
+    if let Ok(mut values) = history().lock() {
+        let entry = values.entry(host.to_string()).or_default();
+        entry.catalog_reachable = Some(latency.is_some());
+        entry.catalog_latency_ms = latency.map(|value| value.as_secs_f64() * 1000.0);
+        entry.catalog_probed_at = chrono::Utc::now().timestamp();
+        save_history(&values);
+    }
+}
+
+fn flush_catalog_probes() {
+    let snapshot = history().lock().ok().map(|values| values.clone());
+    if let Some(values) = snapshot {
+        save_history_durable(values);
+    }
+}
+
+fn catalog_prior(host: &str) -> Option<f64> {
+    let value = history().lock().ok()?.get(host).cloned()?;
+    match value.catalog_reachable {
+        Some(true) => value
+            .catalog_latency_ms
+            .map(|latency| latency_score(Duration::from_secs_f64(latency / 1000.0))),
+        Some(false) => Some(0.0),
+        None => None,
+    }
+}
+
 fn record_rank(host: &str, kind: StreamKind, score: f64, speed_ratio: f64, bandwidth: i64) {
     if let Ok(mut values) = history().lock() {
         let entry = values.entry(host.to_string()).or_default();
@@ -211,13 +385,20 @@ fn record_rank(host: &str, kind: StreamKind, score: f64, speed_ratio: f64, bandw
 }
 
 pub fn record_cdn_result(host: &str, corrupted: bool) {
-    if let Ok(mut values) = history().lock() {
+    let snapshot = if let Ok(mut values) = history().lock() {
         let entry = values.entry(host.to_string()).or_default();
         entry.attempts = entry.attempts.saturating_add(1);
         if corrupted {
             entry.corruptions = entry.corruptions.saturating_add(1);
         }
-        save_history(&values);
+        Some(values.clone())
+    } else {
+        None
+    };
+    // Playback outcomes are sparse and must survive an immediate application
+    // exit, unlike high-frequency probe samples handled by the writer thread.
+    if let Some(values) = snapshot {
+        save_history_durable(values);
     }
 }
 
@@ -304,32 +485,25 @@ async fn probe(client: &reqwest::Client, url: String) -> (String, Option<ProbeSc
     (url, score)
 }
 
-async fn rank_urls(stream: &DashStream, kind: StreamKind) -> Result<Vec<CdnCandidate>> {
+async fn rank_urls(
+    stream: &DashStream,
+    kind: StreamKind,
+    region: Option<catalog::Region>,
+) -> Result<Vec<CdnCandidate>> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(800))
         .build()?;
-    let (region, regional_hosts) = catalog::regional_hosts(&client).await;
     let mut urls = Vec::with_capacity(
-        regional_hosts.len()
-            + 1
-            + stream.backup_url.as_ref().map_or(0, Vec::len)
+        1 + stream.backup_url.as_ref().map_or(0, Vec::len)
             + stream.backup_url_camel.as_ref().map_or(0, Vec::len),
     );
     let primary = stream
         .primary_url()
         .ok_or_else(|| anyhow!("CDN 流缺少主地址"))?;
-    // Keep API-provided URLs first: their query can contain CDN-specific
-    // signatures (for example Akamai `hdnts`). Synthetic catalog URLs are
-    // only a fallback for hosts absent from the playurl response.
+    // Only playurl-provided URLs are authorized. Replacing the host of a
+    // signed URL leaks its token and is not guaranteed to remain valid.
     urls.push(primary.to_string());
     urls.extend(stream.backup_urls().cloned());
-    for candidate_host in regional_hosts {
-        if let Ok(mut url) = reqwest::Url::parse(primary)
-            && url.set_host(Some(&candidate_host)).is_ok()
-        {
-            urls.push(url.to_string());
-        }
-    }
     urls.sort_by_key(|url| host(url));
     urls.dedup_by(|a, b| host(a) == host(b));
 
@@ -346,28 +520,29 @@ async fn rank_urls(stream: &DashStream, kind: StreamKind) -> Result<Vec<CdnCandi
                 probe.throughput_bps / stream.bandwidth as f64
             };
             let speed = speed_score(ratio);
-            let score = reliability(&host) * 0.55 + latency * 0.35 + speed.min(1.0) * 0.10;
+            let region_factor = region_factor(region, &host);
+            let base_score = (reliability(&host) * 0.55 + latency * 0.35 + speed.min(1.0) * 0.10)
+                * region_factor;
+            let score = catalog_prior(&host)
+                .map(|prior| base_score * 0.95 + prior * 0.05)
+                .unwrap_or(base_score);
             record_rank(&host, kind, score, ratio, stream.bandwidth);
             Some(CdnCandidate { url, host, score })
         })
         .collect::<Vec<_>>();
-    let mut preferred = all_ranked
-        .iter()
-        .filter(|candidate| match region {
-            catalog::Region::MainlandChina => !catalog::is_overseas_host(&candidate.host),
-            catalog::Region::Overseas => catalog::is_overseas_host(&candidate.host),
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut ranked = if preferred.is_empty() {
-        all_ranked
-    } else {
-        std::mem::take(&mut preferred)
-    };
+    let mut ranked = all_ranked;
     ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
     (!ranked.is_empty())
         .then_some(ranked)
         .ok_or_else(|| anyhow!("没有可用的 CDN 节点"))
+}
+
+fn region_factor(region: Option<catalog::Region>, host: &str) -> f64 {
+    match region {
+        Some(catalog::Region::MainlandChina) if catalog::is_overseas_host(host) => 0.92,
+        Some(catalog::Region::Overseas) if !catalog::is_overseas_host(host) => 0.92,
+        _ => 1.0,
+    }
 }
 
 fn latency_score(latency: Duration) -> f64 {
@@ -404,9 +579,13 @@ pub async fn rank_streams(data: &PlayUrlData) -> Result<RankedStreams> {
         .into_iter()
         .max_by_key(|stream| stream.bandwidth)
         .ok_or_else(|| anyhow!("播放地址没有音频流"))?;
+    let region_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(800))
+        .build()?;
+    let region = catalog::playback_region(&region_client).await;
     let (video, audio) = tokio::join!(
-        rank_urls(video, StreamKind::Video),
-        rank_urls(audio, StreamKind::Audio)
+        rank_urls(video, StreamKind::Video, region),
+        rank_urls(audio, StreamKind::Audio, region)
     );
     Ok(RankedStreams {
         video: video?,
@@ -452,6 +631,18 @@ mod tests {
     }
 
     #[test]
+    fn unknown_region_does_not_bias_cdn_hosts() {
+        assert_eq!(region_factor(None, "upos-hz-mirrorakam.akamaized.net"), 1.0);
+        assert_eq!(region_factor(None, "upos-sz-mirrorali.bilivideo.com"), 1.0);
+        assert!(
+            region_factor(
+                Some(catalog::Region::Overseas),
+                "upos-sz-mirrorali.bilivideo.com"
+            ) < 1.0
+        );
+    }
+
+    #[test]
     fn ranking_database_accepts_legacy_history_records() {
         let value: CdnHistory = serde_json::from_value(serde_json::json!({
             "attempts": 10,
@@ -462,5 +653,15 @@ mod tests {
         assert_eq!(value.corruptions, 1);
         assert_eq!(value.probe_samples, 0);
         assert!(value.video_score.is_none());
+        assert_eq!(value.catalog_reachable, None);
+    }
+
+    #[test]
+    fn catalog_latency_is_a_small_ranking_prior() {
+        let fast = latency_score(Duration::from_millis(20));
+        let slow = latency_score(Duration::from_millis(500));
+        assert!(fast > slow);
+        let base = 0.8;
+        assert!(base * 0.95 + fast * 0.05 > base * 0.95 + slow * 0.05);
     }
 }

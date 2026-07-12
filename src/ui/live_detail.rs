@@ -133,7 +133,7 @@ impl LiveDetailPage {
                 match LiveClient::connect(self.room_id, uid, &danmu_info).await {
                     Ok(client) => {
                         self.live_client = Some(client);
-                        self.ws_connected = true;
+                        self.ws_connected = false;
                         self.ws_error = None;
                     }
                     Err(e) => {
@@ -150,6 +150,16 @@ impl LiveDetailPage {
 
     /// Poll for new messages from WebSocket
     pub fn poll_messages(&mut self) {
+        if let Some(client) = self.live_client.as_mut() {
+            if let Some(error) = client.take_error() {
+                self.ws_connected = false;
+                self.ws_error = Some(format!("WebSocket连接异常: {error}"));
+            }
+            if client.is_connected() {
+                self.ws_connected = true;
+                self.ws_error = None;
+            }
+        }
         // Collect messages first to avoid borrow issues
         let messages: Vec<LiveMessage> = if let Some(ref mut client) = self.live_client {
             let mut msgs = Vec::new();

@@ -10,16 +10,32 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static COOKIE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn write_private_file(path: &std::path::Path, content: &[u8]) -> Result<()> {
+    let sequence = COOKIE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
     let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(content)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temporary);
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -502,4 +518,14 @@ pub fn export_cookies_for_ytdlp(credentials: &Credentials) -> Result<PathBuf> {
 
     write_private_file(&path, content.as_bytes())?;
     Ok(path)
+}
+
+/// Remove a temporary cookie export. This is safe to call on error paths and
+/// succeeds when the file has already been removed.
+pub fn remove_cookie_export(path: &std::path::Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }

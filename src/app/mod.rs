@@ -65,7 +65,14 @@ pub struct App {
     pub playback: PlaybackState,
     playback_event_tx: mpsc::Sender<PlaybackEvent>,
     playback_event_rx: mpsc::Receiver<PlaybackEvent>,
-    auto_return_after_playback: Option<String>,
+    auto_return_after_playback: Option<(u64, String)>,
+    next_playback_session_id: u64,
+    pending_playlist: Option<(
+        Vec<crate::domain::playback::PlaylistItem>,
+        crate::domain::playback::PlaylistSource,
+        usize,
+        crate::domain::playback::PlayOrder,
+    )>,
 
     /// Cached home page to avoid refresh when switching tabs
     pub cached_home: Option<HomePage>,
@@ -121,6 +128,8 @@ impl App {
             playback_event_tx,
             playback_event_rx,
             auto_return_after_playback: None,
+            next_playback_session_id: 1,
+            pending_playlist: None,
             cached_home: None,
             cached_bangumi: None,
             network_command_tx: bridge.command_tx,
@@ -139,6 +148,12 @@ impl App {
 
     fn send_network_command(&self, command: network::NetworkCommand) {
         let _ = self.network_command_tx.send(command);
+    }
+
+    fn allocate_playback_session(&mut self) -> u64 {
+        let id = self.next_playback_session_id;
+        self.next_playback_session_id = self.next_playback_session_id.saturating_add(1);
+        id
     }
 }
 
@@ -192,10 +207,12 @@ mod tests {
         app.navigation_stack.push(Page::Home(HomePage::new()));
         app.current_page =
             Page::VideoDetail(Box::new(VideoDetailPage::new("BV1test".to_string(), 1)));
-        app.auto_return_after_playback = Some("BV1test".to_string());
+        app.playback.begin_session(7);
+        app.auto_return_after_playback = Some((7, "BV1test".to_string()));
         app.playback_event_tx
             .send(PlaybackEvent::Finished {
-                bvid: "BV1test".to_string(),
+                session_id: 7,
+                bvid: Some("BV1test".to_string()),
             })
             .unwrap();
 
@@ -204,5 +221,27 @@ mod tests {
         assert!(matches!(app.current_page, Page::Home(_)));
         assert!(app.navigation_stack.is_empty());
         assert!(app.auto_return_after_playback.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_playback_session_does_not_return() {
+        let mut app = App::new();
+        app.navigation_stack.push(Page::Home(HomePage::new()));
+        app.current_page =
+            Page::VideoDetail(Box::new(VideoDetailPage::new("BV1test".to_string(), 1)));
+        app.playback.begin_session(8);
+        app.auto_return_after_playback = Some((8, "BV1test".to_string()));
+        app.playback_event_tx
+            .send(PlaybackEvent::Finished {
+                session_id: 7,
+                bvid: Some("BV1test".to_string()),
+            })
+            .unwrap();
+        app.tick().await;
+        assert!(matches!(app.current_page, Page::VideoDetail(_)));
+        assert_eq!(
+            app.playback.status,
+            crate::domain::playback::PlaybackStatus::Playing
+        );
     }
 }

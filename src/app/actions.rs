@@ -89,6 +89,9 @@ impl App {
                 cid,
                 duration,
             } => {
+                let session_id = self.allocate_playback_session();
+                self.playback.session_id = None;
+                self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
                 let api_client = self.api_client.clone();
                 match media::play_video(
                     api_client,
@@ -99,12 +102,12 @@ impl App {
                     None,
                     self.credentials.as_ref(),
                     self.playback_event_tx.clone(),
+                    session_id,
                 )
                 .await
                 {
                     Ok(()) => {
-                        self.playback.status = crate::domain::playback::PlaybackStatus::Playing;
-                        self.playback.last_error = None;
+                        self.playback.begin_session(session_id);
                     }
                     Err(error) => {
                         self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
@@ -120,6 +123,9 @@ impl App {
             } => {
                 // Play only the selected episode
                 if current_index < pages.len() {
+                    let session_id = self.allocate_playback_session();
+                    self.playback.session_id = None;
+                    self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
                     let page = &pages[current_index];
                     let api_client = self.api_client.clone();
                     match media::play_video(
@@ -131,12 +137,12 @@ impl App {
                         Some(page.page),
                         self.credentials.as_ref(),
                         self.playback_event_tx.clone(),
+                        session_id,
                     )
                     .await
                     {
                         Ok(()) => {
-                            self.playback.status = crate::domain::playback::PlaybackStatus::Playing;
-                            self.playback.last_error = None;
+                            self.playback.begin_session(session_id);
                         }
                         Err(error) => {
                             self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
@@ -163,53 +169,15 @@ impl App {
                 video_order,
                 play_order,
             } => {
-                let mut items = Vec::new();
-                let mut page_number = 1;
-                let result: anyhow::Result<()> = async {
-                    loop {
-                        let data = self
-                            .api_client
-                            .get_space_videos(mid, page_number, 40, video_order)
-                            .await?;
-                        let total = data.page.count as usize;
-                        let page_items = data.list.vlist;
-                        let page_was_empty = page_items.is_empty();
-                        items.extend(page_items.into_iter().map(|video| {
-                            crate::domain::playback::PlaylistItem {
-                                bvid: video.bvid,
-                                aid: video.aid,
-                                cid: None,
-                                title: video.title,
-                                uploader_mid: Some(video.mid.unwrap_or(mid)),
-                                duration: video.duration,
-                                page: None,
-                            }
-                        }));
-                        if page_was_empty || items.len() >= total {
-                            break;
-                        }
-                        page_number += 1;
-                    }
-                    Ok(())
-                }
-                .await;
-                if let Err(error) = result {
-                    self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                    self.playback.last_error = Some(format!("加载UP主播放列表失败: {error:#}"));
-                    return;
-                }
-                let start_index = if play_order == crate::domain::playback::PlayOrder::Reverse {
-                    items.len().saturating_sub(1)
-                } else {
-                    0
-                };
-                self.start_playlist(
-                    items,
-                    crate::domain::playback::PlaylistSource::Uploader { mid, name },
-                    start_index,
+                self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
+                let req_id = self.next_request_id("playlist_build");
+                self.send_network_command(network::NetworkCommand::BuildUpPlaylist {
+                    req_id,
+                    mid,
+                    name,
+                    video_order,
                     play_order,
-                )
-                .await;
+                });
             }
             AppAction::PlayFavoriteAll {
                 media_id,
@@ -217,51 +185,15 @@ impl App {
                 favorite_order,
                 play_order,
             } => {
-                let mut items = Vec::new();
-                let mut page_number = 1;
-                let result: anyhow::Result<()> = async {
-                    loop {
-                        let data = self
-                            .api_client
-                            .get_favorite_resources(media_id, page_number, 40, favorite_order)
-                            .await?;
-                        let has_more = data.has_more.unwrap_or(false);
-                        items.extend(data.medias.into_iter().filter_map(|media| {
-                            Some(crate::domain::playback::PlaylistItem {
-                                bvid: media.bvid?,
-                                aid: media.id,
-                                cid: None,
-                                title: media.title,
-                                uploader_mid: media.upper.as_ref().map(|upper| upper.mid),
-                                duration: media.duration,
-                                page: None,
-                            })
-                        }));
-                        if !has_more {
-                            break;
-                        }
-                        page_number += 1;
-                    }
-                    Ok(())
-                }
-                .await;
-                if let Err(error) = result {
-                    self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
-                    self.playback.last_error = Some(format!("加载收藏夹播放列表失败: {error:#}"));
-                    return;
-                }
-                let start_index = if play_order == crate::domain::playback::PlayOrder::Reverse {
-                    items.len().saturating_sub(1)
-                } else {
-                    0
-                };
-                self.start_playlist(
-                    items,
-                    crate::domain::playback::PlaylistSource::Favorites { media_id, title },
-                    start_index,
+                self.playback.status = crate::domain::playback::PlaybackStatus::Starting;
+                let req_id = self.next_request_id("playlist_build");
+                self.send_network_command(network::NetworkCommand::BuildFavoritePlaylist {
+                    req_id,
+                    media_id,
+                    title,
+                    favorite_order,
                     play_order,
-                )
-                .await;
+                });
             }
             AppAction::NavNext => {
                 // Don't navigate if on video detail page
@@ -482,73 +414,77 @@ impl App {
                 });
             }
             AppAction::BackToList if !self.navigation_stack.is_empty() => {
+                self.auto_return_after_playback = None;
                 self.current_page = self
                     .navigation_stack
                     .pop()
                     .expect("navigation stack checked as non-empty");
             }
-            AppAction::BackToList => match self.previous_page.take() {
-                Some(PreviousPage::Home) => {
-                    self.sidebar.select(NavItem::Home);
-                    // Use cached home page if available
-                    if let Some(cached) = self.cached_home.take() {
-                        self.current_page = Page::Home(cached);
-                    } else {
-                        self.current_page = Page::Home(HomePage::new());
+            AppAction::BackToList => {
+                self.auto_return_after_playback = None;
+                match self.previous_page.take() {
+                    Some(PreviousPage::Home) => {
+                        self.sidebar.select(NavItem::Home);
+                        // Use cached home page if available
+                        if let Some(cached) = self.cached_home.take() {
+                            self.current_page = Page::Home(cached);
+                        } else {
+                            self.current_page = Page::Home(HomePage::new());
+                            self.init_current_page().await;
+                        }
+                    }
+                    Some(PreviousPage::Search) => {
+                        self.sidebar.select(NavItem::Search);
+                        self.current_page = Page::Search(SearchPage::new());
                         self.init_current_page().await;
                     }
-                }
-                Some(PreviousPage::Search) => {
-                    self.sidebar.select(NavItem::Search);
-                    self.current_page = Page::Search(SearchPage::new());
-                    self.init_current_page().await;
-                }
-                Some(PreviousPage::Dynamic) => {
-                    self.sidebar.select(NavItem::Dynamic);
-                    self.current_page = Page::Dynamic(DynamicPage::new());
-                    self.init_current_page().await;
-                }
-                Some(PreviousPage::History) => {
-                    self.sidebar.select(NavItem::History);
-                    self.current_page = Page::History(HistoryPage::new());
-                    self.init_current_page().await;
-                }
-                Some(PreviousPage::Favorites) => {
-                    self.sidebar.select(NavItem::Favorites);
-                    let mid = self
-                        .credentials
-                        .as_ref()
-                        .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok());
-                    if let Some(mid) = mid {
-                        self.current_page = Page::Favorites(FavoritesPage::new(mid));
+                    Some(PreviousPage::Dynamic) => {
+                        self.sidebar.select(NavItem::Dynamic);
+                        self.current_page = Page::Dynamic(DynamicPage::new());
                         self.init_current_page().await;
                     }
-                }
-                Some(PreviousPage::Live) => {
-                    self.sidebar.select(NavItem::Live);
-                    self.current_page = Page::Live(LivePage::new());
-                    self.init_current_page().await;
-                }
-                Some(PreviousPage::Bangumi) => {
-                    self.sidebar.select(NavItem::Bangumi);
-                    if let Some(cached) = self.cached_bangumi.take() {
-                        self.current_page = Page::Bangumi(Box::new(cached));
-                    } else {
-                        self.current_page = Page::Bangumi(Box::<BangumiPage>::default());
+                    Some(PreviousPage::History) => {
+                        self.sidebar.select(NavItem::History);
+                        self.current_page = Page::History(HistoryPage::new());
                         self.init_current_page().await;
                     }
-                }
-                None => {
-                    // Default to home
-                    self.sidebar.select(NavItem::Home);
-                    if let Some(cached) = self.cached_home.take() {
-                        self.current_page = Page::Home(cached);
-                    } else {
-                        self.current_page = Page::Home(HomePage::new());
+                    Some(PreviousPage::Favorites) => {
+                        self.sidebar.select(NavItem::Favorites);
+                        let mid = self
+                            .credentials
+                            .as_ref()
+                            .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok());
+                        if let Some(mid) = mid {
+                            self.current_page = Page::Favorites(FavoritesPage::new(mid));
+                            self.init_current_page().await;
+                        }
+                    }
+                    Some(PreviousPage::Live) => {
+                        self.sidebar.select(NavItem::Live);
+                        self.current_page = Page::Live(LivePage::new());
                         self.init_current_page().await;
                     }
+                    Some(PreviousPage::Bangumi) => {
+                        self.sidebar.select(NavItem::Bangumi);
+                        if let Some(cached) = self.cached_bangumi.take() {
+                            self.current_page = Page::Bangumi(Box::new(cached));
+                        } else {
+                            self.current_page = Page::Bangumi(Box::<BangumiPage>::default());
+                            self.init_current_page().await;
+                        }
+                    }
+                    None => {
+                        // Default to home
+                        self.sidebar.select(NavItem::Home);
+                        if let Some(cached) = self.cached_home.take() {
+                            self.current_page = Page::Home(cached);
+                        } else {
+                            self.current_page = Page::Home(HomePage::new());
+                            self.init_current_page().await;
+                        }
+                    }
                 }
-            },
+            }
             AppAction::LoadMoreRecommendations => {
                 if let Page::Home(page) = &mut self.current_page
                     && let Some(fresh_idx) = page.begin_load_more()
@@ -870,7 +806,7 @@ impl App {
         }
     }
 
-    async fn start_playlist(
+    pub(super) async fn start_playlist(
         &mut self,
         items: Vec<crate::domain::playback::PlaylistItem>,
         source: crate::domain::playback::PlaylistSource,
@@ -880,9 +816,20 @@ impl App {
         self.playback.replace_queue(source, items.clone());
         self.playback.order = order;
         let _ = self.playback.play_from(start_index);
-        match media::play_playlist(items, order, start_index, self.credentials.as_ref()).await {
+        let session_id = self.allocate_playback_session();
+        match media::play_playlist(
+            self.api_client.clone(),
+            items,
+            order,
+            start_index,
+            self.credentials.as_ref(),
+            self.playback_event_tx.clone(),
+            session_id,
+        )
+        .await
+        {
             Ok(()) => {
-                self.playback.status = crate::domain::playback::PlaybackStatus::Playing;
+                self.playback.begin_session(session_id);
             }
             Err(error) => {
                 self.playback.status = crate::domain::playback::PlaybackStatus::Failed;

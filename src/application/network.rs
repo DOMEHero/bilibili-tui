@@ -18,6 +18,7 @@ use crate::api::{
     video::RelatedVideoItem,
     video::VideoInfo,
 };
+use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
 use crate::presentation::tui::DynamicTab;
 use std::sync::{Arc, mpsc};
 
@@ -91,6 +92,20 @@ pub enum NetworkCommand {
         media_id: i64,
         page: i32,
         order: FavoriteOrder,
+    },
+    BuildUpPlaylist {
+        req_id: u64,
+        mid: i64,
+        name: String,
+        video_order: SpaceVideoOrder,
+        play_order: PlayOrder,
+    },
+    BuildFavoritePlaylist {
+        req_id: u64,
+        media_id: i64,
+        title: String,
+        favorite_order: FavoriteOrder,
+        play_order: PlayOrder,
     },
     LoadFavoritesInit {
         req_id: u64,
@@ -186,6 +201,13 @@ pub enum NetworkEvent {
         order: FavoriteOrder,
         resources: FavoriteResourceData,
     },
+    PlaylistLoaded {
+        req_id: u64,
+        items: Vec<PlaylistItem>,
+        source: PlaylistSource,
+        start_index: usize,
+        order: PlayOrder,
+    },
     FavoritesInitLoaded {
         req_id: u64,
         mid: i64,
@@ -256,10 +278,12 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
             };
 
             while let Ok(command) = command_rx.recv() {
-                let event = runtime.block_on(handle_command(api_client.clone(), command));
-                if event_tx.send(event).is_err() {
-                    break;
-                }
+                let api_client = api_client.clone();
+                let event_tx = event_tx.clone();
+                runtime.spawn(async move {
+                    let event = handle_command(api_client, command).await;
+                    let _ = event_tx.send(event);
+                });
             }
         })
         .expect("failed to spawn network worker");
@@ -374,6 +398,99 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
             },
             Err(error) => failed(req_id, "favorite_resources", error),
         },
+        NetworkCommand::BuildUpPlaylist {
+            req_id,
+            mid,
+            name,
+            video_order,
+            play_order,
+        } => {
+            let mut items = Vec::new();
+            let mut page = 1;
+            loop {
+                let data = match api_client
+                    .get_space_videos(mid, page, 40, video_order)
+                    .await
+                {
+                    Ok(data) => data,
+                    Err(error) => return failed(req_id, "playlist_build", error),
+                };
+                let total = data.page.count as usize;
+                let empty = data.list.vlist.is_empty();
+                items.extend(data.list.vlist.into_iter().map(|video| PlaylistItem {
+                    bvid: video.bvid,
+                    aid: video.aid,
+                    cid: None,
+                    title: video.title,
+                    uploader_mid: Some(video.mid.unwrap_or(mid)),
+                    duration: video.duration,
+                    page: None,
+                }));
+                if empty || items.len() >= total {
+                    break;
+                }
+                page += 1;
+            }
+            let start_index = if play_order == PlayOrder::Reverse {
+                items.len().saturating_sub(1)
+            } else {
+                0
+            };
+            NetworkEvent::PlaylistLoaded {
+                req_id,
+                items,
+                source: PlaylistSource::Uploader { mid, name },
+                start_index,
+                order: play_order,
+            }
+        }
+        NetworkCommand::BuildFavoritePlaylist {
+            req_id,
+            media_id,
+            title,
+            favorite_order,
+            play_order,
+        } => {
+            let mut items = Vec::new();
+            let mut page = 1;
+            loop {
+                let data = match api_client
+                    .get_favorite_resources(media_id, page, 40, favorite_order)
+                    .await
+                {
+                    Ok(data) => data,
+                    Err(error) => return failed(req_id, "playlist_build", error),
+                };
+                let has_more = data.has_more.unwrap_or(false);
+                items.extend(data.medias.into_iter().filter_map(|media| {
+                    Some(PlaylistItem {
+                        bvid: media.bvid?,
+                        aid: media.id,
+                        cid: None,
+                        title: media.title,
+                        uploader_mid: media.upper.as_ref().map(|upper| upper.mid),
+                        duration: media.duration,
+                        page: None,
+                    })
+                }));
+                if !has_more {
+                    break;
+                }
+                page += 1;
+            }
+            let start_index = if play_order == PlayOrder::Reverse {
+                items.len().saturating_sub(1)
+            } else {
+                0
+            };
+            NetworkEvent::PlaylistLoaded {
+                req_id,
+                items,
+                source: PlaylistSource::Favorites { media_id, title },
+                start_index,
+                order: play_order,
+            }
+        }
         NetworkCommand::LoadFavoritesInit { req_id, mid } => {
             match api_client.get_watch_later(1, 20).await {
                 Ok(watch_later) => {
@@ -635,19 +752,27 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
 }
 
 fn failed(req_id: u64, target: &'static str, error: anyhow::Error) -> NetworkEvent {
+    let safe_error = redact_url_queries(&error.to_string());
     if let Some(mut dir) = dirs::config_dir() {
         dir.push("bilibili-tui");
+        let log_path = dir.join("debug.log");
         if std::fs::create_dir_all(&dir).is_ok()
             && let Ok(mut log) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(dir.join("debug.log"))
+                .open(&log_path)
         {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600));
+            }
             use std::io::Write;
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let safe_log_error = redact_url_queries(&format!("{error:#}"));
             let _ = writeln!(
                 log,
-                "[{timestamp}] Network request failed\nTarget: {target}\nRequest ID: {req_id}\nError: {error:#}\n"
+                "[{timestamp}] Network request failed\nTarget: {target}\nRequest ID: {req_id}\nError: {safe_log_error}\n"
             );
         }
     }
@@ -655,6 +780,37 @@ fn failed(req_id: u64, target: &'static str, error: anyhow::Error) -> NetworkEve
     NetworkEvent::RequestFailed {
         req_id,
         target,
-        error: error.to_string(),
+        error: safe_error,
+    }
+}
+
+pub(crate) fn redact_url_queries(message: &str) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(ch) = chars.next() {
+        output.push(ch);
+        if ch == '?' {
+            output.push_str("<redacted>");
+            while chars
+                .peek()
+                .is_some_and(|next| !next.is_whitespace() && !matches!(next, '"' | '\''))
+            {
+                chars.next();
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::redact_url_queries;
+
+    #[test]
+    fn network_log_redacts_url_query_parameters() {
+        let value =
+            redact_url_queries("GET https://cdn.example/video?token=secret&expires=1 failed");
+        assert_eq!(value, "GET https://cdn.example/video?<redacted> failed");
+        assert!(!value.contains("secret"));
     }
 }

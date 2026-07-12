@@ -40,4 +40,4 @@ Pull requests should explain the user-visible change, implementation approach, a
 
 ## Security & Configuration
 
-Never commit cookies, credentials, debug response bodies, or files from the platform configuration directory. Redact Bilibili identifiers and session data from bug reports and logs.
+Never commit cookies, credentials, debug response bodies, or files from the platform configuration directory. Redact Bilibili identifiers, query strings, signed media URLs, and session data from bug reports and logs. Diagnostic code must not persist response bodies by default and must create any potentially private log with owner-only permissions.

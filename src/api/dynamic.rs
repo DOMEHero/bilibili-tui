@@ -78,6 +78,60 @@ mod tests {
     }
 
     #[test]
+    fn feed_accepts_numeric_fields_as_numbers_strings_and_null() {
+        let json = r#"{
+          "items": [{
+            "id_str": "1",
+            "type": "DYNAMIC_TYPE_DRAW",
+            "modules": {
+              "module_author": {"pub_ts": "1720000000"},
+              "module_dynamic": {"major": {
+                "type": "MAJOR_TYPE_DRAW",
+                "draw": {"id": "42", "items": [
+                  {"src": "a", "height": "1080", "width": 1920, "size": "1.25"},
+                  {"src": "b", "height": null, "width": null, "size": 2.5}
+                ]}
+              }}
+            }
+          }],
+          "offset": null,
+          "has_more": false,
+          "update_num": 0
+        }"#;
+        let data: DynamicFeedData = serde_json::from_str(json).expect("mixed numeric forms");
+        let item = &data.items.expect("items")[0];
+        let modules = item.modules.as_ref().expect("modules");
+        assert_eq!(
+            modules.module_author.as_ref().and_then(|a| a.pub_ts),
+            Some(1_720_000_000)
+        );
+        let draw = modules
+            .module_dynamic
+            .as_ref()
+            .and_then(|d| d.major.as_ref())
+            .and_then(|m| m.draw.as_ref())
+            .expect("draw");
+        assert_eq!(draw.id, Some(42));
+        let pictures = draw.items.as_ref().expect("pictures");
+        assert_eq!(
+            (pictures[0].height, pictures[0].width, pictures[0].size),
+            (Some(1080), Some(1920), Some(1.25))
+        );
+        assert_eq!(
+            (pictures[1].height, pictures[1].width, pictures[1].size),
+            (None, None, Some(2.5))
+        );
+    }
+
+    #[test]
+    fn feed_rejects_invalid_or_out_of_range_numeric_strings() {
+        let invalid = r#"{"items":[{"modules":{"module_author":{"pub_ts":"not-a-number"}}}]}"#;
+        assert!(serde_json::from_str::<DynamicFeedData>(invalid).is_err());
+        let overflow = r#"{"items":[{"modules":{"module_dynamic":{"major":{"draw":{"items":[{"height":"2147483648"}]}}}}}]}"#;
+        assert!(serde_json::from_str::<DynamicFeedData>(overflow).is_err());
+    }
+
+    #[test]
     fn saved_real_feed_response_deserializes_when_fixture_is_available() {
         let Ok(path) = std::env::var("BILIBILI_DYNAMIC_FIXTURE") else {
             return;

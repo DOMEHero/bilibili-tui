@@ -49,7 +49,20 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
-    fn write_decode_diagnostic(url: &str, error: &serde_json::Error, body: &[u8]) {
+    fn safe_url(url: &str) -> String {
+        reqwest::Url::parse(url)
+            .map(|url| {
+                format!(
+                    "{}://{}{}",
+                    url.scheme(),
+                    url.host_str().unwrap_or(""),
+                    url.path()
+                )
+            })
+            .unwrap_or_else(|_| "<invalid URL>".to_string())
+    }
+
+    fn write_decode_diagnostic(url: &str, error: &serde_json::Error) {
         let Some(mut dir) = dirs::config_dir() else {
             return;
         };
@@ -59,27 +72,41 @@ impl ApiClient {
         }
 
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        if let Ok(mut log) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("debug.log"))
+        let safe_url = Self::safe_url(url);
+        let log_path = dir.join("debug.log");
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut log) = options.open(&log_path) {
             let _ = writeln!(
                 log,
-                "[{timestamp}] JSON decode failed\nURL: {url}\nError: {error}\nResponse saved to: {}\n",
-                dir.join("last-decode-error.json").display()
+                "[{timestamp}] JSON decode failed\nURL: {safe_url}\nError: {error}\n"
             );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600));
+            }
         }
-
-        // Keep the complete latest failing response so type drift can be
-        // inspected even when the TUI only has room for a short error message.
-        let _ = fs::write(dir.join("last-decode-error.json"), body);
     }
 
     pub fn new() -> Self {
+        // Older builds persisted complete failed API responses. Remove that
+        // legacy diagnostic because it can contain account-specific data.
+        if let Some(mut path) = dirs::config_dir() {
+            path.push("bilibili-tui");
+            path.push("last-decode-error.json");
+            let _ = fs::remove_file(path);
+        }
         Self {
             client: Client::builder()
                 .default_headers(Self::default_headers())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(20))
                 .build()
                 .expect("Failed to create HTTP client"),
             cookies: RwLock::new(None),
@@ -136,38 +163,53 @@ impl ApiClient {
         // A Bilibili CDN connection can occasionally close while the compressed
         // response body is being read. Retrying a read-only GET once prevents a
         // transient truncated body from surfacing as a dynamic-page failure.
+        let safe_url = Self::safe_url(url);
         for attempt in 0..2 {
             let mut req = self.client.get(url);
             if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
                 req = req.header(COOKIE, cookies.as_str());
             }
 
-            let resp = req
-                .send()
-                .await
-                .with_context(|| format!("request failed for {url}"))?;
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(_) if attempt == 0 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("request failed for {safe_url}"));
+                }
+            };
             let status = resp.status();
             let body = match resp.bytes().await {
                 Ok(body) => body,
                 Err(_) if attempt == 0 => continue,
                 Err(error) => {
                     return Err(error)
-                        .with_context(|| format!("failed to read response body from {url}"));
+                        .with_context(|| format!("failed to read response body from {safe_url}"));
                 }
             };
 
             if !status.is_success() {
-                let preview = String::from_utf8_lossy(&body);
-                let preview: String = preview.chars().take(200).collect();
-                return Err(anyhow!("HTTP {status} from {url}: {preview}"));
+                if attempt == 0 && (status.is_server_error() || status.as_u16() == 429) {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    continue;
+                }
+                return Err(anyhow!("HTTP {status} from {safe_url}"));
             }
 
-            return serde_json::from_slice(&body).map_err(|error| {
-                Self::write_decode_diagnostic(url, &error, &body);
-                let preview = String::from_utf8_lossy(&body);
-                let preview: String = preview.chars().take(200).collect();
-                anyhow!("invalid JSON response from {url}: {error}; body starts with: {preview}")
-            });
+            let response: ApiResponse<T> = serde_json::from_slice(&body).map_err(|error| {
+                Self::write_decode_diagnostic(url, &error);
+                anyhow!("invalid JSON response from {safe_url}: {error}")
+            })?;
+            if response.code != 0 {
+                return Err(anyhow!(
+                    "API error ({}): {}",
+                    response.code,
+                    response.message
+                ));
+            }
+            return Ok(response);
         }
 
         unreachable!("GET retry loop always returns")
@@ -179,7 +221,7 @@ impl ApiClient {
         if let Some(ref cookies) = *self.cookies.read().expect("cookies lock poisoned") {
             req = req.header(COOKIE, cookies.as_str());
         }
-        let resp = req.send().await?;
+        let resp = req.send().await?.error_for_status()?;
         let value: serde_json::Value = resp.json().await?;
         Ok(value)
     }
@@ -225,8 +267,15 @@ impl ApiClient {
         }; // 锁在此处释放
 
         req = req.form(&params);
-        let resp = req.send().await?;
+        let resp = req.send().await?.error_for_status()?;
         let api_resp: ApiResponse<T> = resp.json().await?;
+        if api_resp.code != 0 {
+            return Err(anyhow!(
+                "API error ({}): {}",
+                api_resp.code,
+                api_resp.message
+            ));
+        }
         Ok(api_resp)
     }
 
@@ -312,7 +361,7 @@ impl ApiClient {
             req = req.header(COOKIE, cookies.as_str());
         }
 
-        let resp = req.send().await?;
+        let resp = req.send().await?.error_for_status()?;
 
         // Extract cookies from response headers
         let mut new_cookies = Vec::new();
@@ -369,7 +418,7 @@ impl ApiClient {
             req = req.header(COOKIE, cookies.as_str());
         }
 
-        let value: serde_json::Value = req.send().await?.json().await?;
+        let value: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
         let code = value
             .get("code")
             .and_then(|v| v.as_i64())
@@ -723,7 +772,7 @@ impl ApiClient {
             req = req.header(COOKIE, cookies.as_str());
         }
 
-        let resp = req.send().await?;
+        let resp = req.send().await?.error_for_status()?;
         let data: super::search::HotwordResponse = resp.json().await?;
 
         if let Some(code) = data.code
@@ -1159,7 +1208,7 @@ impl ApiClient {
             req = req.header(COOKIE, cookies.as_str());
         }
 
-        let resp = req.send().await?;
+        let resp = req.send().await?.error_for_status()?;
         let api_resp: ApiResponse<super::live::LiveRecommendData> = resp.json().await?;
 
         Ok(api_resp
@@ -1263,7 +1312,7 @@ impl ApiClient {
             req = req.header(COOKIE, cookies.as_str());
         }
 
-        let resp = req.send().await?;
+        let resp = req.send().await?.error_for_status()?;
         let api_resp: ApiResponse<super::live::LiveRoomInfo> = resp.json().await?;
 
         api_resp
@@ -1311,17 +1360,11 @@ impl ApiClient {
                 req = req.header(COOKIE, cookies.as_str());
             }
 
-            let resp = req.send().await?;
+            let resp = req.send().await?.error_for_status()?;
             let resp_text = resp.text().await?;
 
             let api_resp: ApiResponse<super::live_ws::DanmuInfoData> =
-                serde_json::from_str(&resp_text).map_err(|e| {
-                    anyhow::anyhow!(
-                        "解析失败: {} (响应: {})",
-                        e,
-                        &resp_text[..resp_text.len().min(200)]
-                    )
-                })?;
+                serde_json::from_str(&resp_text).map_err(|e| anyhow::anyhow!("解析失败: {e}"))?;
 
             if api_resp.code == 0 {
                 return api_resp.data.ok_or_else(|| anyhow::anyhow!("响应无数据"));
@@ -1357,7 +1400,7 @@ impl ApiClient {
             req = req.header(COOKIE, cookies.as_str());
         }
 
-        let resp = req.send().await?;
+        let resp = req.send().await?.error_for_status()?;
         let api_resp: ApiResponse<super::live_ws::HistoryDanmakuData> = resp.json().await?;
 
         if api_resp.code != 0 {

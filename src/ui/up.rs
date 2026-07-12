@@ -34,6 +34,7 @@ pub struct UpPage {
     pub folders: Vec<FavoriteFolder>,
     pub folder_selected: usize,
     pub active_folder: Option<i64>,
+    pub pending_folder: Option<i64>,
     pub favorite_videos: VideoCardGrid,
     pub favorite_page: i32,
     pub favorite_order: FavoriteOrder,
@@ -58,6 +59,7 @@ impl UpPage {
             folders: Vec::new(),
             folder_selected: 0,
             active_folder: None,
+            pending_folder: None,
             favorite_videos: VideoCardGrid::new(),
             favorite_page: 1,
             favorite_order: FavoriteOrder::RecentlyFavorited,
@@ -130,6 +132,7 @@ impl UpPage {
             self.favorite_videos.clear();
         }
         self.active_folder = Some(media_id);
+        self.pending_folder = None;
         self.favorite_page = page;
         self.favorite_has_more = resources.has_more.unwrap_or(false);
         for media in resources.medias {
@@ -166,6 +169,7 @@ impl UpPage {
     pub fn set_error(&mut self, error: String) {
         self.loading = false;
         self.loading_more = false;
+        self.pending_folder = None;
         self.error = Some(error);
     }
 
@@ -288,7 +292,7 @@ impl Component for UpPage {
 
         frame.render_widget(
             Paragraph::new(format!(
-                "[1/2] 投稿/收藏夹  [o] 最新/热门  [s] 顺序/倒序  [{}] 连播  [Enter] 打开  [{}] 返回",
+                "[1/2] 投稿/收藏夹  [o] 最新/热门  [s] 顺序/倒序/随机  [{}] 连播  [Enter] 打开  [{}] 返回",
                 keys.play, keys.back
             )),
             chunks[3],
@@ -297,6 +301,10 @@ impl Component for UpPage {
 
     fn handle_input(&mut self, key: KeyCode, keys: &Keybindings) -> Option<AppAction> {
         if keys.matches_back(key) || keys.matches_quit(key) {
+            if self.tab == UpTab::Favorites && self.pending_folder.take().is_some() {
+                self.loading = false;
+                return Some(AppAction::None);
+            }
             if self.tab == UpTab::Favorites && self.active_folder.take().is_some() {
                 self.favorite_videos.clear();
                 return Some(AppAction::None);
@@ -329,10 +337,10 @@ impl Component for UpPage {
                 return Some(AppAction::None);
             }
             KeyCode::Char('s') => {
-                self.play_order = if self.play_order == PlayOrder::Forward {
-                    PlayOrder::Reverse
-                } else {
-                    PlayOrder::Forward
+                self.play_order = match self.play_order {
+                    PlayOrder::Forward => PlayOrder::Reverse,
+                    PlayOrder::Reverse => PlayOrder::Shuffle,
+                    PlayOrder::Shuffle => PlayOrder::Forward,
                 };
                 return Some(AppAction::None);
             }
@@ -348,6 +356,7 @@ impl Component for UpPage {
                 && let Some(folder) = self.folders.get(self.folder_selected)
             {
                 self.loading = true;
+                self.pending_folder = Some(folder.id);
                 return Some(AppAction::OpenFavoriteFolder(folder.id));
             }
             return Some(AppAction::None);
@@ -422,4 +431,32 @@ fn format_count(value: i64) -> String {
 
 fn format_duration(seconds: i64) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_order_cycles_through_shuffle() {
+        let mut page = UpPage::new(1);
+        let keys = Keybindings::default();
+        page.handle_input(KeyCode::Char('s'), &keys);
+        assert_eq!(page.play_order, PlayOrder::Reverse);
+        page.handle_input(KeyCode::Char('s'), &keys);
+        assert_eq!(page.play_order, PlayOrder::Shuffle);
+        page.handle_input(KeyCode::Char('s'), &keys);
+        assert_eq!(page.play_order, PlayOrder::Forward);
+    }
+
+    #[test]
+    fn back_cancels_a_pending_folder_without_leaving_up_page() {
+        let mut page = UpPage::new_favorites(1);
+        page.pending_folder = Some(10);
+        page.loading = true;
+        let action = page.handle_input(KeyCode::Esc, &Keybindings::default());
+        assert!(matches!(action, Some(AppAction::None)));
+        assert_eq!(page.pending_folder, None);
+        assert!(!page.loading);
+    }
 }

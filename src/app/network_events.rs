@@ -219,8 +219,21 @@ impl App {
                 if let Page::Up(page) = &mut self.current_page
                     && page.mid == owner_mid
                     && page.favorite_order == order
+                    && (page.pending_folder == Some(media_id)
+                        || page.active_folder == Some(media_id))
                 {
                     page.apply_favorite_resources(media_id, loaded_page, resources);
+                }
+            }
+            network::NetworkEvent::PlaylistLoaded {
+                req_id,
+                items,
+                source,
+                start_index,
+                order,
+            } => {
+                if self.is_latest_request("playlist_build", req_id) {
+                    self.pending_playlist = Some((items, source, start_index, order));
                 }
             }
             network::NetworkEvent::FavoritesInitLoaded {
@@ -386,6 +399,10 @@ impl App {
                     }
                     (Page::Up(page), "favorite_resources") => {
                         page.set_error(format!("加载收藏夹失败: {error}"));
+                    }
+                    (_, "playlist_build") => {
+                        self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
+                        self.playback.last_error = Some(format!("加载播放列表失败: {error}"));
                     }
                     (Page::Favorites(page), "favorites_init")
                     | (Page::Favorites(page), "favorites_content") => {
