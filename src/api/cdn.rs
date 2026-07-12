@@ -94,9 +94,26 @@ struct ProbeScore {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct CdnHistory {
     attempts: u64,
     corruptions: u64,
+    probe_samples: u64,
+    latency_ms: f64,
+    throughput_bps: f64,
+    last_probed_at: i64,
+    video_score: Option<f64>,
+    video_speed_ratio: Option<f64>,
+    video_bandwidth: Option<i64>,
+    audio_score: Option<f64>,
+    audio_speed_ratio: Option<f64>,
+    audio_bandwidth: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Video,
+    Audio,
 }
 
 static CDN_SCORES: OnceLock<Mutex<HashMap<String, CachedScore>>> = OnceLock::new();
@@ -136,7 +153,42 @@ fn save_history(values: &HashMap<String, CdnHistory>) {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(bytes) = serde_json::to_vec_pretty(values) {
-        let _ = fs::write(path, bytes);
+        let temporary = path.with_extension("json.tmp");
+        if fs::write(&temporary, bytes).is_ok() {
+            let _ = fs::rename(temporary, path);
+        }
+    }
+}
+
+fn record_probe(host: &str, probe: ProbeScore) {
+    if let Ok(mut values) = history().lock() {
+        let entry = values.entry(host.to_string()).or_default();
+        let latency_ms = probe.latency.as_secs_f64() * 1000.0;
+        let alpha = if entry.probe_samples == 0 { 1.0 } else { 0.25 };
+        entry.latency_ms = entry.latency_ms * (1.0 - alpha) + latency_ms * alpha;
+        entry.throughput_bps = entry.throughput_bps * (1.0 - alpha) + probe.throughput_bps * alpha;
+        entry.probe_samples = entry.probe_samples.saturating_add(1);
+        entry.last_probed_at = chrono::Utc::now().timestamp();
+        save_history(&values);
+    }
+}
+
+fn record_rank(host: &str, kind: StreamKind, score: f64, speed_ratio: f64, bandwidth: i64) {
+    if let Ok(mut values) = history().lock() {
+        let entry = values.entry(host.to_string()).or_default();
+        match kind {
+            StreamKind::Video => {
+                entry.video_score = Some(score);
+                entry.video_speed_ratio = Some(speed_ratio);
+                entry.video_bandwidth = Some(bandwidth);
+            }
+            StreamKind::Audio => {
+                entry.audio_score = Some(score);
+                entry.audio_speed_ratio = Some(speed_ratio);
+                entry.audio_bandwidth = Some(bandwidth);
+            }
+        }
+        save_history(&values);
     }
 }
 
@@ -162,8 +214,19 @@ fn reliability(host: &str) -> f64 {
 
 fn cached_score(url: &str) -> Option<ProbeScore> {
     let host = host(url)?;
-    let cached = *scores().lock().ok()?.get(&host)?;
-    (cached.measured_at.elapsed() < SCORE_TTL).then_some(cached.probe)
+    if let Some(cached) = scores().lock().ok()?.get(&host).copied()
+        && cached.measured_at.elapsed() < SCORE_TTL
+    {
+        return Some(cached.probe);
+    }
+    let value = history().lock().ok()?.get(&host).cloned()?;
+    let age = chrono::Utc::now().timestamp() - value.last_probed_at;
+    (age >= 0 && age < SCORE_TTL.as_secs() as i64 && value.probe_samples > 0).then_some(
+        ProbeScore {
+            latency: Duration::from_secs_f64(value.latency_ms / 1000.0),
+            throughput_bps: value.throughput_bps,
+        },
+    )
 }
 
 async fn probe(client: &reqwest::Client, url: String) -> (String, Option<ProbeScore>) {
@@ -208,17 +271,19 @@ async fn probe(client: &reqwest::Client, url: String) -> (String, Option<ProbeSc
         && let Ok(mut cache) = scores().lock()
     {
         cache.insert(
-            host,
+            host.clone(),
             CachedScore {
                 measured_at: Instant::now(),
                 probe: score,
             },
         );
+        drop(cache);
+        record_probe(&host, score);
     }
     (url, score)
 }
 
-async fn rank_urls(stream: &DashStream) -> Result<Vec<CdnCandidate>> {
+async fn rank_urls(stream: &DashStream, kind: StreamKind) -> Result<Vec<CdnCandidate>> {
     let mut urls = Vec::with_capacity(
         1 + stream.backup_url.as_ref().map_or(0, Vec::len)
             + stream.backup_url_camel.as_ref().map_or(0, Vec::len),
@@ -250,6 +315,7 @@ async fn rank_urls(stream: &DashStream) -> Result<Vec<CdnCandidate>> {
             };
             let speed = speed_score(ratio);
             let score = reliability(&host) * 0.55 + latency * 0.35 + speed.min(1.0) * 0.10;
+            record_rank(&host, kind, score, ratio, stream.bandwidth);
             Some(CdnCandidate { url, host, score })
         })
         .collect::<Vec<_>>();
@@ -293,7 +359,10 @@ pub async fn rank_streams(data: &PlayUrlData) -> Result<RankedStreams> {
         .into_iter()
         .max_by_key(|stream| stream.bandwidth)
         .ok_or_else(|| anyhow!("播放地址没有音频流"))?;
-    let (video, audio) = tokio::join!(rank_urls(video), rank_urls(audio));
+    let (video, audio) = tokio::join!(
+        rank_urls(video, StreamKind::Video),
+        rank_urls(audio, StreamKind::Audio)
+    );
     Ok(RankedStreams {
         video: video?,
         audio: audio?,
@@ -335,5 +404,18 @@ mod tests {
         assert!(
             latency_score(Duration::from_millis(20)) > latency_score(Duration::from_millis(200))
         );
+    }
+
+    #[test]
+    fn ranking_database_accepts_legacy_history_records() {
+        let value: CdnHistory = serde_json::from_value(serde_json::json!({
+            "attempts": 10,
+            "corruptions": 1
+        }))
+        .unwrap();
+        assert_eq!(value.attempts, 10);
+        assert_eq!(value.corruptions, 1);
+        assert_eq!(value.probe_samples, 0);
+        assert!(value.video_score.is_none());
     }
 }
