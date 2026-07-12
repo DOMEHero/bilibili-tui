@@ -1,8 +1,11 @@
 use crate::api::client::ApiClient;
+use crate::api::live_danmaku_hub::LiveDanmakuHub;
+use crate::api::live_ws::LiveMessage;
 use crate::domain::playback::{PlayOrder, PlaybackEvent, PlaylistItem};
-use crate::storage::Credentials;
+use crate::storage::{Credentials, DanmakuConfig};
 use anyhow::Result;
 use std::collections::VecDeque;
+use std::io::Write as StdWrite;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +19,8 @@ use tokio::time::{Instant, interval_at, timeout};
 mod proxy;
 
 static LIVE_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static MPV_IPC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const LIVE_DANMAKU_SCRIPT: &str = include_str!("live_danmaku.lua");
 
 /// Play a video using mpv with yt-dlp and report watch progress
 /// This function spawns mpv in a background task to avoid blocking the TUI
@@ -81,6 +86,7 @@ pub async fn play_video(
     cmd.arg(format!("--input-ipc-server={}", ipc_path.display()));
     cmd.arg("--msg-level=ffmpeg=error,vd=warn");
     if let Some(proxy) = &media_proxy {
+        cmd.arg("--ytdl=no");
         cmd.arg(format!("--audio-file={}", proxy.audio_url));
         cmd.arg(&proxy.video_url);
     } else {
@@ -253,17 +259,107 @@ fn is_corrupt_video_log(line: &str) -> bool {
     .any(|needle| line.contains(needle))
 }
 
+fn create_live_danmaku_script(ipc_path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let script_path = ipc_path.with_extension("danmaku.lua");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&script_path)?;
+    StdWrite::write_all(&mut file, LIVE_DANMAKU_SCRIPT.as_bytes())?;
+    Ok(script_path)
+}
+
+fn live_danmaku_payload(message: &LiveMessage) -> Option<String> {
+    let LiveMessage::Danmaku { content, color, .. } = message else {
+        return None;
+    };
+
+    serde_json::to_string(&serde_json::json!({
+        "text": content,
+        "color": color,
+    }))
+    .ok()
+}
+
+async fn send_live_danmaku(
+    ipc_path: &std::path::Path,
+    script_path: &std::path::Path,
+    message: &LiveMessage,
+) -> Result<()> {
+    let Some(payload) = live_danmaku_payload(message) else {
+        return Ok(());
+    };
+    let script_name = mpv_script_name(script_path);
+    mpv_ipc(
+        ipc_path,
+        serde_json::json!(["script-message-to", &script_name, "danmaku", payload]),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn send_live_danmaku_config(
+    ipc_path: &std::path::Path,
+    script_path: &std::path::Path,
+    config: &DanmakuConfig,
+) -> Result<()> {
+    let payload = serde_json::to_string(config)?;
+    let script_name = mpv_script_name(script_path);
+    mpv_ipc(
+        ipc_path,
+        serde_json::json!(["script-message-to", &script_name, "danmaku-config", payload]),
+    )
+    .await
+    .map(|_| ())
+}
+
+fn mpv_script_name(script_path: &std::path::Path) -> String {
+    let script_stem = script_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("live_danmaku");
+    // MPV normalizes script filenames to identifiers before using them as
+    // `script-message-to` targets (for example, '-' and '.' become '_').
+    script_stem
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 async fn mpv_ipc(path: &std::path::Path, command: serde_json::Value) -> Result<serde_json::Value> {
     timeout(Duration::from_secs(2), async {
         let mut stream = UnixStream::connect(path).await?;
-        let mut bytes = serde_json::to_vec(&serde_json::json!({ "command": command }))?;
+        let request_id = MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "command": command,
+            "request_id": request_id,
+        }))?;
         bytes.push(b'\n');
         stream.write_all(&bytes).await?;
+        let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).await?;
-        let value: serde_json::Value = serde_json::from_str(&line)?;
-        ensure_mpv_success(&value)?;
-        Ok(value)
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                anyhow::bail!("MPV IPC closed before command response");
+            }
+            let value: serde_json::Value = serde_json::from_str(&line)?;
+            if value.get("request_id").and_then(|value| value.as_u64()) != Some(request_id) {
+                continue;
+            }
+            ensure_mpv_success(&value)?;
+            return Ok(value);
+        }
     })
     .await
     .map_err(|_| anyhow::anyhow!("MPV IPC timed out"))?
@@ -435,6 +531,7 @@ pub async fn play_playlist(
     cmd.arg("--idle=yes");
     cmd.arg("--force-window=immediate");
     cmd.arg("--msg-level=ffmpeg=error,vd=warn");
+    cmd.arg("--ytdl=no");
     let ipc_path = std::env::temp_dir().join(format!(
         "bilibili-tui-playlist-{}-{session_id}.sock",
         std::process::id()
@@ -903,7 +1000,12 @@ pub async fn play_bangumi_episode(ep_id: i64, credentials: Option<&Credentials>)
 
 /// Play a live stream using mpv
 /// This function spawns mpv in a background task to avoid blocking the TUI
-pub async fn play_live(api_client: Arc<ApiClient>, room_id: i64) -> Result<()> {
+pub async fn play_live(
+    api_client: Arc<ApiClient>,
+    room_id: i64,
+    danmaku_hub: Option<Arc<LiveDanmakuHub>>,
+    mut danmaku_config_rx: tokio::sync::watch::Receiver<DanmakuConfig>,
+) -> Result<()> {
     let mut urls = api_client.get_best_live_stream_urls(room_id).await?;
     let first_url = urls
         .first()
@@ -914,11 +1016,26 @@ pub async fn play_live(api_client: Arc<ApiClient>, room_id: i64) -> Result<()> {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&ipc_path);
-    let mut child = spawn_live_mpv(&ipc_path)?;
+    let _ = std::fs::remove_file(ipc_path.with_extension("danmaku.lua"));
+    let danmaku_script_path = create_live_danmaku_script(&ipc_path)?;
+    let mut child = match spawn_live_mpv(&ipc_path, &danmaku_script_path) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&danmaku_script_path).await;
+            return Err(error);
+        }
+    };
     if let Err(error) = wait_for_ipc(&ipc_path, &mut child).await {
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(1)).await;
         let _ = tokio::fs::remove_file(&ipc_path).await;
+        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
         return Err(error);
+    }
+    let initial_danmaku_config = danmaku_config_rx.borrow_and_update().clone();
+    if let Err(error) =
+        send_live_danmaku_config(&ipc_path, &danmaku_script_path, &initial_danmaku_config).await
+    {
+        write_live_diagnostic(room_id, &format!("live danmaku config IPC error: {error}"));
     }
 
     let (end_tx, mut end_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -931,19 +1048,26 @@ pub async fn play_live(api_client: Arc<ApiClient>, room_id: i64) -> Result<()> {
         observer.abort();
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(1)).await;
         let _ = tokio::fs::remove_file(&ipc_path).await;
+        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
         anyhow::bail!("直播 MPV 事件监听启动超时");
     }
     if let Err(error) = load_live_and_wait(&ipc_path, first_url).await {
         observer.abort();
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(1)).await;
         let _ = tokio::fs::remove_file(&ipc_path).await;
+        let _ = tokio::fs::remove_file(&danmaku_script_path).await;
         return Err(error);
     }
 
+    let mut danmaku_rx = danmaku_hub.as_ref().map(|hub| hub.subscribe());
     tokio::spawn(async move {
+        // Keep the shared connection alive even if the application switches to
+        // another room while this MPV instance is still playing.
+        let _danmaku_hub = danmaku_hub;
         let mut next_url = 1usize;
         let mut consecutive_failures = 0usize;
         let mut loaded_at = Instant::now();
+        let mut danmaku_config_open = true;
         'playback: loop {
             tokio::select! {
                 status = child.wait() => {
@@ -1025,11 +1149,42 @@ pub async fn play_live(api_client: Arc<ApiClient>, room_id: i64) -> Result<()> {
                         break;
                     }
                 }
+                message = async {
+                    danmaku_rx.as_mut().expect("guarded danmaku receiver").recv().await
+                }, if danmaku_rx.is_some() => {
+                    match message {
+                        Ok(message) if matches!(message, LiveMessage::Danmaku { .. }) => {
+                            if let Err(error) =
+                                send_live_danmaku(&ipc_path, &danmaku_script_path, &message).await
+                            {
+                                write_live_diagnostic(room_id, &format!("live danmaku IPC error: {error}"));
+                            }
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            danmaku_rx = None;
+                            write_live_diagnostic(room_id, "live danmaku hub closed");
+                        }
+                    }
+                }
+                changed = danmaku_config_rx.changed(), if danmaku_config_open => {
+                    if changed.is_ok() {
+                        let config = danmaku_config_rx.borrow_and_update().clone();
+                        if let Err(error) =
+                            send_live_danmaku_config(&ipc_path, &danmaku_script_path, &config).await
+                        {
+                            write_live_diagnostic(room_id, &format!("live danmaku config IPC error: {error}"));
+                        }
+                    } else {
+                        danmaku_config_open = false;
+                    }
+                }
             }
         }
         shutdown_live_child(&ipc_path, &mut child, Duration::from_secs(2)).await;
         observer.abort();
         let _ = tokio::fs::remove_file(ipc_path).await;
+        let _ = tokio::fs::remove_file(danmaku_script_path).await;
     });
 
     Ok(())
@@ -1060,17 +1215,27 @@ async fn shutdown_live_child(
     }
 }
 
-fn spawn_live_mpv(ipc_path: &std::path::Path) -> Result<tokio::process::Child> {
+fn spawn_live_mpv(
+    ipc_path: &std::path::Path,
+    danmaku_script_path: &std::path::Path,
+) -> Result<tokio::process::Child> {
     let mut cmd = Command::new("mpv");
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     configure_live_mpv(&mut cmd, ipc_path);
+    cmd.arg(format!("--script={}", danmaku_script_path.display()));
     Ok(cmd.spawn()?)
 }
 
 fn configure_live_mpv(cmd: &mut Command, ipc_path: &std::path::Path) {
     cmd.arg("--idle=yes");
     cmd.arg("--force-window=immediate");
+    cmd.arg("--keep-open=yes");
+    // A live HLS window must always start at its live edge. Inheriting the
+    // user's watch-later state resumes near the end of a finite playlist and
+    // produces an EOF loop a few seconds later.
+    cmd.arg("--save-position-on-quit=no");
+    cmd.arg("--resume-playback=no");
     // A user-level mpv.conf may enable a verbose global log, which would
     // expose short-lived signed stream URLs. Live failover diagnostics are
     // written separately without URLs by write_live_diagnostic().
@@ -1078,11 +1243,33 @@ fn configure_live_mpv(cmd: &mut Command, ipc_path: &std::path::Path) {
     cmd.arg(format!("--input-ipc-server={}", ipc_path.display()));
     cmd.arg("--referrer=https://live.bilibili.com/");
     cmd.arg("--cache=yes");
-    cmd.arg("--cache-secs=20");
-    cmd.arg("--demuxer-readahead-secs=20");
+    cmd.arg("--cache-secs=3600");
+    cmd.arg("--demuxer-readahead-secs=3600");
     cmd.arg("--network-timeout=10");
     cmd.arg("--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
     cmd.arg("--hwdec=auto-safe");
+    #[cfg(target_os = "macos")]
+    if let Some(font_dir) = macos_live_font_dir() {
+        // Load the selected public Chinese font asset directly and disable
+        // CoreText fallback to inaccessible Reserved font files.
+        cmd.arg("--sub-font-provider=none");
+        cmd.arg(format!("--sub-fonts-dir={}", font_dir.display()));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_live_font_dir() -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}\n", "Yuanti SC"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let file = String::from_utf8(output.stdout).ok()?;
+    std::path::Path::new(file.lines().next()?.trim())
+        .parent()
+        .map(std::path::Path::to_path_buf)
 }
 
 fn should_reload_live_reason(reason: &str) -> bool {
@@ -1221,6 +1408,71 @@ mod playlist_tests {
         assert_eq!(live_retry_delay(100), Duration::from_secs(4));
     }
 
+    #[tokio::test]
+    async fn mpv_ipc_ignores_events_before_its_matching_response() {
+        let path = std::env::temp_dir().join(format!(
+            "bilibili-tui-ipc-test-{}-{}.sock",
+            std::process::id(),
+            MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind test IPC");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept IPC");
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.expect("read request");
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let request_id = request["request_id"].as_u64().unwrap();
+            let stream = reader.get_mut();
+            stream
+                .write_all(b"{\"event\":\"client-message\"}\n")
+                .await
+                .unwrap();
+            stream
+                .write_all(
+                    format!("{{\"error\":\"success\",\"request_id\":{request_id}}}\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = mpv_ipc(&path, serde_json::json!(["get_property", "pause"]))
+            .await
+            .expect("matching response");
+        assert_eq!(response["error"], "success");
+        server.await.unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_danmaku_payload_contains_text_and_color() {
+        let message = LiveMessage::Danmaku {
+            uid: 7,
+            uname: "tester".to_string(),
+            content: "你好".to_string(),
+            color: 0x12_34_56,
+        };
+        let payload = live_danmaku_payload(&message).expect("danmaku payload");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("valid payload");
+        assert_eq!(value["text"], "你好");
+        assert_eq!(value["color"], 0x12_34_56);
+        assert!(live_danmaku_payload(&LiveMessage::Popularity(1)).is_none());
+    }
+
+    #[test]
+    fn live_danmaku_script_registers_the_ipc_message_handler() {
+        assert!(LIVE_DANMAKU_SCRIPT.contains("register_script_message"));
+        assert!(LIVE_DANMAKU_SCRIPT.contains("danmaku-config"));
+        assert!(LIVE_DANMAKU_SCRIPT.contains("create_osd_overlay"));
+        assert!(LIVE_DANMAKU_SCRIPT.contains("\\pos("));
+        assert!(LIVE_DANMAKU_SCRIPT.contains("observe_property(\"display-fps\""));
+        assert!(LIVE_DANMAKU_SCRIPT.contains("add_periodic_timer(1 / fps"));
+        assert!(LIVE_DANMAKU_SCRIPT.contains("get_property_number(\"display-fps\""));
+        assert!(LIVE_DANMAKU_SCRIPT.contains("video-reconfig"));
+        assert!(!LIVE_DANMAKU_SCRIPT.contains("sub-reload"));
+    }
+
     #[test]
     fn live_mpv_is_idle_ipc_controlled_and_disables_global_url_logging() {
         let mut command = Command::new("mpv");
@@ -1231,6 +1483,9 @@ mod playlist_tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(args.iter().any(|arg| arg == "--idle=yes"));
+        assert!(args.iter().any(|arg| arg == "--keep-open=yes"));
+        assert!(args.iter().any(|arg| arg == "--resume-playback=no"));
+        assert!(args.iter().any(|arg| arg == "--cache-secs=3600"));
         assert!(args.iter().any(|arg| arg == "--log-file="));
         assert!(args.iter().any(|arg| arg.ends_with("/tmp/live-test.sock")));
         assert!(!args.iter().any(|arg| arg.contains("bilivideo.com")));
@@ -1283,6 +1538,7 @@ mod playlist_tests {
             std::process::id()
         ));
         configure_live_mpv(&mut cmd, &ipc);
+        cmd.arg("--idle=no");
         cmd.arg(url);
         let mut child = cmd.spawn().expect("spawn mpv");
         let status = tokio::time::timeout(Duration::from_secs(30), child.wait())

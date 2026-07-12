@@ -325,7 +325,9 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("range").then(|| value.trim())
     });
-    let video_index = generation(path).unwrap_or_else(|| state.video_index.load(Ordering::Acquire));
+    let video_index = generation(path)
+        .unwrap_or(0)
+        .max(state.video_index.load(Ordering::Acquire));
     let candidate = if route == "/video" {
         let index = video_index;
         state.video.get(index).cloned()
@@ -408,6 +410,18 @@ async fn serve(mut socket: TcpStream, state: Arc<ProxyState>) -> Result<()> {
                     {
                         state.audio_index.store(index, Ordering::Release);
                         prefetch_audio(state.clone());
+                        recovered = Some(response);
+                        break;
+                    }
+                }
+            } else if route == "/video" {
+                record_cdn_result(&candidate.host, true);
+                for index in (video_index + 1)..state.video.len() {
+                    if let Ok(response) = send(&state.video[index]).await
+                        && is_media_response(response.status())
+                    {
+                        state.video_index.store(index, Ordering::Release);
+                        prefetch_backup(state.clone());
                         recovered = Some(response);
                         break;
                     }

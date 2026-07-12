@@ -1,7 +1,8 @@
 //! Homepage with video recommendations in a grid layout with cover images
 
-use super::{Component, Theme};
+use super::{Component, SearchPage, Theme};
 use crate::api::client::ApiClient;
+use crate::api::recommend::HomeFeed;
 use crate::api::recommend::VideoItem;
 use crate::application::AppAction;
 use crate::storage::Keybindings;
@@ -49,13 +50,119 @@ pub struct HomePage {
     // Double-click detection
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
+    feed: HomeFeed,
+    pub search: SearchPage,
+    pub focus_sources: bool,
+    pub selected_source: usize,
+}
+
+impl HomePage {
+    fn draw_sources(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let items = (0..self.source_count())
+            .map(|index| {
+                ListItem::new(self.source_label(index)).style(if index == self.selected_source {
+                    Style::default()
+                        .fg(if self.focus_sources {
+                            theme.bilibili_pink
+                        } else {
+                            theme.bilibili_cyan
+                        })
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg_secondary)
+                })
+            })
+            .collect::<Vec<_>>();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border_subtle))
+                    .title(" 首页 "),
+            )
+            .highlight_symbol("▶ ");
+        let mut state = ListState::default().with_selected(Some(self.selected_source));
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+
+    fn draw_feed(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(2),
+            ])
+            .split(area);
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(" 首页  ", Style::default().fg(theme.fg_accent)),
+            Span::styled(
+                self.feed.label(),
+                Style::default()
+                    .fg(theme.bilibili_pink)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            if self.loading_more {
+                Span::styled("  加载中…", Style::default().fg(theme.warning))
+            } else {
+                Span::raw("")
+            },
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        );
+        frame.render_widget(header, chunks[0]);
+
+        if self.loading {
+            frame.render_widget(
+                Paragraph::new("⏳ 加载中…")
+                    .style(Style::default().fg(theme.warning))
+                    .alignment(Alignment::Center),
+                chunks[1],
+            );
+        } else if let Some(error) = &self.error_message {
+            frame.render_widget(
+                Paragraph::new(format!("❌ {error}"))
+                    .style(Style::default().fg(theme.error))
+                    .alignment(Alignment::Center),
+                chunks[1],
+            );
+        } else if self.videos.is_empty() {
+            frame.render_widget(
+                Paragraph::new("📭 暂无推荐视频")
+                    .style(Style::default().fg(theme.fg_secondary))
+                    .alignment(Alignment::Center),
+                chunks[1],
+            );
+        } else {
+            self.render_grid(frame, chunks[1], theme);
+        }
+
+        let notice = self.footer_notice.take();
+        let mut help = format!(
+            "[↑/↓] 选择视频  [{} / {}] 翻页  [←/→] 切换面板  [{}] 播放  [{}] 搜索  [{}] 刷新",
+            keys.page_up, keys.page_down, keys.confirm, keys.search_focus, keys.refresh
+        );
+        if let Some(notice) = notice {
+            help.push_str(&format!("  {notice}"));
+        }
+        frame.render_widget(
+            Paragraph::new(help)
+                .style(Style::default().fg(theme.fg_secondary))
+                .alignment(Alignment::Center),
+            chunks[2],
+        );
+    }
 }
 
 impl HomePage {
     /// 默认列数
-    const DEFAULT_COLUMNS: usize = 3;
+    const DEFAULT_COLUMNS: usize = 1;
     /// 卡片高度
-    const CARD_HEIGHT: u16 = 10;
+    const CARD_HEIGHT: u16 = 8;
     /// 预取缓冲行数（可见区域之外额外下载）
     const PREFETCH_BUFFER_ROWS: usize = 2;
     /// 初始可见行数回退值（首次渲染前使用）
@@ -87,6 +194,10 @@ impl HomePage {
             footer_notice: None,
             last_click_time: None,
             last_click_index: None,
+            feed: HomeFeed::Recommended,
+            search: SearchPage::new(),
+            focus_sources: true,
+            selected_source: 1,
         }
     }
 
@@ -120,7 +231,10 @@ impl HomePage {
         self.fresh_idx = 1;
     }
 
-    pub fn apply_recommendations(&mut self, videos: Vec<VideoItem>) {
+    pub fn apply_recommendations(&mut self, feed: HomeFeed, videos: Vec<VideoItem>) {
+        if self.feed != feed {
+            return;
+        }
         self.videos = videos
             .into_iter()
             .map(|video| VideoCard { video, cover: None })
@@ -137,7 +251,7 @@ impl HomePage {
     }
 
     pub fn begin_load_more(&mut self) -> Option<i32> {
-        if self.loading_more {
+        if self.loading_more || !matches!(self.feed, HomeFeed::Recommended | HomeFeed::Popular) {
             return None;
         }
         self.loading_more = true;
@@ -145,7 +259,10 @@ impl HomePage {
         Some(self.fresh_idx)
     }
 
-    pub fn apply_load_more(&mut self, videos: Vec<VideoItem>) {
+    pub fn apply_load_more(&mut self, feed: HomeFeed, videos: Vec<VideoItem>) {
+        if self.feed != feed {
+            return;
+        }
         for video in videos {
             self.videos.push(VideoCard { video, cover: None });
         }
@@ -198,40 +315,39 @@ impl HomePage {
 
     /// Start background downloads for visible covers (non-blocking)
     pub fn start_cover_downloads(&mut self) {
-        if self.videos.is_empty() {
-            return;
-        }
+        if !self.videos.is_empty() {
+            // Calculate visible range using current viewport rows + small buffer
+            let start = self.scroll_row * self.columns;
+            let prefetch_rows = self.cached_visible_rows + Self::PREFETCH_BUFFER_ROWS;
+            let end = (start + self.columns * prefetch_rows).min(self.videos.len());
 
-        // Calculate visible range using current viewport rows + small buffer
-        let start = self.scroll_row * self.columns;
-        let prefetch_rows = self.cached_visible_rows + Self::PREFETCH_BUFFER_ROWS;
-        let end = (start + self.columns * prefetch_rows).min(self.videos.len());
+            for idx in start..end {
+                // Skip if already has cover or is pending
+                if self.videos[idx].cover.is_some() || self.pending_downloads.contains(&idx) {
+                    continue;
+                }
 
-        for idx in start..end {
-            // Skip if already has cover or is pending
-            if self.videos[idx].cover.is_some() || self.pending_downloads.contains(&idx) {
-                continue;
-            }
+                if let Some(pic_url) = self.videos[idx].video.pic.clone() {
+                    self.pending_downloads.insert(idx);
+                    let tx = self.cover_tx.clone();
+                    let picker = Arc::clone(&self.picker);
 
-            if let Some(pic_url) = self.videos[idx].video.pic.clone() {
-                self.pending_downloads.insert(idx);
-                let tx = self.cover_tx.clone();
-                let picker = Arc::clone(&self.picker);
-
-                // Spawn background task
-                tokio::spawn(async move {
-                    if let Some(img) = Self::download_image(&pic_url).await {
-                        let protocol = picker.new_resize_protocol(img);
-                        let _ = tx
-                            .send(CoverResult {
-                                index: idx,
-                                protocol,
-                            })
-                            .await;
-                    }
-                });
+                    // Spawn background task
+                    tokio::spawn(async move {
+                        if let Some(img) = Self::download_image(&pic_url).await {
+                            let protocol = picker.new_resize_protocol(img);
+                            let _ = tx
+                                .send(CoverResult {
+                                    index: idx,
+                                    protocol,
+                                })
+                                .await;
+                        }
+                    });
+                }
             }
         }
+        self.search.start_cover_downloads();
     }
 
     /// Poll for completed cover downloads (non-blocking)
@@ -243,6 +359,7 @@ impl HomePage {
                 self.pending_downloads.remove(&result.index);
             }
         }
+        self.search.poll_cover_results();
     }
 
     async fn download_image(url: &str) -> Option<DynamicImage> {
@@ -269,12 +386,89 @@ impl HomePage {
         }
     }
 
+    fn move_page(&mut self, down: bool) -> bool {
+        let Some(last_index) = self.videos.len().checked_sub(1) else {
+            return false;
+        };
+        let page_size = self
+            .cached_visible_rows
+            .max(1)
+            .saturating_mul(self.columns.max(1));
+        let old_index = self.selected_index;
+        self.selected_index = if down {
+            old_index.saturating_add(page_size).min(last_index)
+        } else {
+            old_index.saturating_sub(page_size)
+        };
+        if self.selected_index == old_index {
+            return false;
+        }
+        self.update_scroll(self.cached_visible_rows.max(1));
+        true
+    }
+
     fn total_rows(&self) -> usize {
         self.videos.len().div_ceil(self.columns)
     }
 
     pub fn set_footer_notice(&mut self, notice: String) {
         self.footer_notice = Some(notice);
+    }
+
+    pub fn feed(&self) -> HomeFeed {
+        self.feed
+    }
+
+    pub fn search_mut(&mut self) -> &mut SearchPage {
+        &mut self.search
+    }
+
+    pub fn search_ref(&self) -> &SearchPage {
+        &self.search
+    }
+
+    pub fn begin_search(&mut self) {
+        self.selected_source = 0;
+        self.focus_sources = false;
+        self.search.input_mode = true;
+        self.search.show_hot_list = true;
+    }
+
+    pub fn select_source(&mut self, source: usize) {
+        self.selected_source = source.min(HomeFeed::ALL.len());
+        if self.selected_source == 0 {
+            self.begin_search();
+        }
+    }
+
+    pub fn source_count(&self) -> usize {
+        HomeFeed::ALL.len() + 1
+    }
+
+    fn source_label(&self, index: usize) -> String {
+        if index == 0 {
+            "🔍 搜索".to_string()
+        } else {
+            HomeFeed::ALL[index - 1].label().to_string()
+        }
+    }
+
+    fn source_feed(&self, index: usize) -> Option<HomeFeed> {
+        (index > 0).then(|| HomeFeed::ALL[index - 1])
+    }
+
+    pub fn begin_feed_load(&mut self, feed: HomeFeed) {
+        self.feed = feed;
+        self.selected_source = HomeFeed::ALL
+            .iter()
+            .position(|candidate| *candidate == feed)
+            .map(|index| index + 1)
+            .unwrap_or(1);
+        self.begin_loading();
+        self.videos.clear();
+        self.selected_index = 0;
+        self.scroll_row = 0;
+        self.loading_more = false;
     }
 }
 
@@ -286,143 +480,17 @@ impl Default for HomePage {
 
 impl Component for HomePage {
     fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(2),
-            ])
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(30)])
             .split(area);
+        self.draw_sources(frame, panes[0], theme);
 
-        // Header with enhanced styling
-        let title = Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(
-                "B",
-                Style::default()
-                    .fg(theme.bilibili_pink)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "ilibili ",
-                Style::default()
-                    .fg(theme.fg_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("推荐", Style::default().fg(theme.fg_accent)),
-        ]);
-
-        let header = Paragraph::new(title)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.border_subtle))
-                    .title(Span::styled(
-                        " 首页 ",
-                        Style::default()
-                            .fg(theme.fg_accent)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .alignment(Alignment::Center);
-        frame.render_widget(header, chunks[0]);
-
-        // Video grid
-        if self.loading {
-            let loading = Paragraph::new("⏳ 加载中...")
-                .style(
-                    Style::default()
-                        .fg(theme.warning)
-                        .add_modifier(Modifier::ITALIC),
-                )
-                .alignment(Alignment::Center);
-            frame.render_widget(loading, chunks[1]);
-        } else if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("❌ {}", error))
-                .style(Style::default().fg(theme.error))
-                .alignment(Alignment::Center);
-            frame.render_widget(error_widget, chunks[1]);
-        } else if self.videos.is_empty() {
-            let empty = Paragraph::new("📭 暂无推荐视频")
-                .style(Style::default().fg(theme.fg_secondary))
-                .alignment(Alignment::Center);
-            frame.render_widget(empty, chunks[1]);
+        if self.selected_source == 0 {
+            self.search.draw(frame, panes[1], theme, keys);
         } else {
-            self.render_grid(frame, chunks[1], theme);
+            self.draw_feed(frame, panes[1], theme, keys);
         }
-
-        // Help with styled shortcuts
-        let arrow_keys = keys.get_arrow_keys_display();
-        let nav_keys = keys.get_nav_keys_display();
-        let confirm = keys.confirm.clone();
-        let refresh = keys.refresh.clone();
-        let quit = keys.quit.clone();
-        let next_theme = keys.next_theme.clone();
-
-        let help_line = Line::from(vec![
-            Span::styled(" [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &arrow_keys,
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("/", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &nav_keys,
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("导航", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &confirm,
-                Style::default()
-                    .fg(theme.success)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("播放", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &refresh,
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("刷新", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &quit,
-                Style::default()
-                    .fg(theme.error)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("退出", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &next_theme,
-                Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("切换主题", Style::default().fg(theme.fg_secondary)),
-        ]);
-        let help_text = if let Some(notice) = self.footer_notice.take() {
-            Text::from(vec![
-                help_line,
-                Line::from(Span::styled(notice, Style::default().fg(theme.warning))),
-            ])
-        } else {
-            Text::from(help_line)
-        };
-        let help = Paragraph::new(help_text).alignment(Alignment::Center);
-        frame.render_widget(help, chunks[2]);
     }
 
     fn handle_input(
@@ -433,6 +501,67 @@ impl Component for HomePage {
         if keys.matches_quit(key) {
             return Some(AppAction::Quit);
         }
+        if keys.matches_search_focus(key) {
+            self.begin_search();
+            return Some(AppAction::None);
+        }
+        // Tab navigation always wins, including while either pane is loading.
+        if keys.matches_nav_next(key) {
+            return Some(AppAction::NavNext);
+        }
+        if keys.matches_nav_prev(key) {
+            return Some(AppAction::NavPrev);
+        }
+        if self.focus_sources {
+            if keys.matches_down(key) {
+                self.selected_source = (self.selected_source + 1) % self.source_count();
+            } else if keys.matches_up(key) {
+                self.selected_source = if self.selected_source == 0 {
+                    self.source_count() - 1
+                } else {
+                    self.selected_source - 1
+                };
+            } else if keys.matches_right(key) || keys.matches_confirm(key) {
+                if self.selected_source == 0 {
+                    self.begin_search();
+                } else if let Some(feed) = self.source_feed(self.selected_source)
+                    && feed != self.feed
+                {
+                    self.focus_sources = false;
+                    return Some(AppAction::SwitchHomeFeed(feed));
+                } else {
+                    self.focus_sources = false;
+                }
+            }
+            return Some(AppAction::None);
+        }
+
+        if keys.matches_left(key) {
+            self.focus_sources = true;
+            if self.selected_source == 0 || self.loading || self.loading_more {
+                self.loading = false;
+                self.loading_more = false;
+                return Some(AppAction::CancelPendingLoads);
+            }
+            return Some(AppAction::None);
+        }
+        if self.selected_source == 0 {
+            return self.search.handle_input(key, keys);
+        }
+        if self.loading {
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_down(key) {
+            self.move_page(true);
+            if self.is_near_bottom(self.cached_visible_rows) && !self.loading_more {
+                return Some(AppAction::LoadMoreRecommendations);
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_up(key) {
+            self.move_page(false);
+            return Some(AppAction::None);
+        }
         if keys.matches_down(key) {
             if !self.videos.is_empty() {
                 let new_idx = self.selected_index + self.columns;
@@ -440,7 +569,6 @@ impl Component for HomePage {
                     self.selected_index = new_idx;
                 }
                 self.update_scroll(self.cached_visible_rows);
-                // Check for pagination
                 if self.is_near_bottom(self.cached_visible_rows) && !self.loading_more {
                     return Some(AppAction::LoadMoreRecommendations);
                 }
@@ -450,20 +578,6 @@ impl Component for HomePage {
         if keys.matches_up(key) {
             if !self.videos.is_empty() && self.selected_index >= self.columns {
                 self.selected_index -= self.columns;
-                self.update_scroll(self.cached_visible_rows);
-            }
-            return Some(AppAction::None);
-        }
-        if keys.matches_right(key) {
-            if !self.videos.is_empty() && self.selected_index + 1 < self.videos.len() {
-                self.selected_index += 1;
-                self.update_scroll(self.cached_visible_rows);
-            }
-            return Some(AppAction::None);
-        }
-        if keys.matches_left(key) {
-            if !self.videos.is_empty() && self.selected_index > 0 {
-                self.selected_index -= 1;
                 self.update_scroll(self.cached_visible_rows);
             }
             return Some(AppAction::None);
@@ -492,12 +606,6 @@ impl Component for HomePage {
             self.pending_downloads.clear();
             return Some(AppAction::RefreshHome);
         }
-        if keys.matches_nav_next(key) {
-            return Some(AppAction::NavNext);
-        }
-        if keys.matches_nav_prev(key) {
-            return Some(AppAction::NavPrev);
-        }
         if keys.matches_next_theme(key) {
             return Some(AppAction::NextTheme);
         }
@@ -508,6 +616,51 @@ impl Component for HomePage {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .split(area);
+        let position = ratatui::layout::Position::new(event.column, event.row);
+
+        if panes[0].contains(position) {
+            self.focus_sources = true;
+            match event.kind {
+                MouseEventKind::ScrollDown => {
+                    self.selected_source = (self.selected_source + 1) % self.source_count();
+                }
+                MouseEventKind::ScrollUp => {
+                    self.selected_source = if self.selected_source == 0 {
+                        self.source_count() - 1
+                    } else {
+                        self.selected_source - 1
+                    };
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let row = event.row.saturating_sub(panes[0].y + 1) as usize;
+                    if row < self.source_count() {
+                        self.selected_source = row;
+                        if row == 0 {
+                            self.begin_search();
+                        } else if let Some(feed) = self.source_feed(row)
+                            && feed != self.feed
+                        {
+                            return Some(AppAction::SwitchHomeFeed(feed));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Some(AppAction::None);
+        }
+
+        if !panes[1].contains(position) {
+            return None;
+        }
+        self.focus_sources = false;
+        if self.selected_source == 0 {
+            return self.search.handle_mouse(event, panes[1]);
+        }
+
         match event.kind {
             MouseEventKind::ScrollDown => {
                 // Scroll down by one row
@@ -533,9 +686,8 @@ impl Component for HomePage {
                 None
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Check if click is within content area (below header, above help)
-                let content_top = area.y + 3; // After header
-                let content_bottom = area.y + area.height.saturating_sub(2); // Before help
+                let content_top = panes[1].y + 3;
+                let content_bottom = panes[1].bottom().saturating_sub(2);
 
                 if event.row >= content_top && event.row < content_bottom {
                     // Calculate which card was clicked
@@ -543,8 +695,8 @@ impl Component for HomePage {
                     let click_row = (relative_y / self.card_height) as usize;
                     let actual_row = self.scroll_row + click_row;
 
-                    let card_width = area.width / self.columns as u16;
-                    let click_col = (event.column.saturating_sub(area.x) / card_width) as usize;
+                    let card_width = panes[1].width / self.columns as u16;
+                    let click_col = (event.column.saturating_sub(panes[1].x) / card_width) as usize;
 
                     let click_idx = actual_row * self.columns + click_col.min(self.columns - 1);
 
@@ -686,8 +838,8 @@ impl HomePage {
         frame.render_widget(block, area);
 
         let card_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(4), Constraint::Length(4)])
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(30)])
             .split(inner);
 
         // Cover area - render with StatefulImage
@@ -741,20 +893,85 @@ impl HomePage {
 
         let meta_style = Style::default().fg(theme.fg_secondary);
 
+        let follower = card
+            .video
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.follower)
+            .map(format_count)
+            .unwrap_or_else(|| "-".to_string());
+        let danmaku = card
+            .video
+            .stat
+            .as_ref()
+            .and_then(|stat| stat.danmaku)
+            .map(format_count)
+            .unwrap_or_else(|| "-".to_string());
+        let replies = card
+            .video
+            .stat
+            .as_ref()
+            .and_then(|stat| stat.reply)
+            .map(format_count)
+            .unwrap_or_else(|| "-".to_string());
         let info_text = Text::from(vec![
             Line::from(Span::styled(&display_title, title_style)),
-            Line::from(Span::styled(
-                author,
-                Style::default().fg(theme.fg_secondary),
-            )),
             Line::from(vec![
-                Span::styled(&views, meta_style),
-                Span::styled(" · ", meta_style),
-                Span::styled(&duration, Style::default().fg(theme.success)),
+                Span::styled("UP  ", meta_style),
+                Span::styled(author, Style::default().fg(theme.bilibili_cyan)),
+                Span::styled(format!("  ·  {follower} 关注"), meta_style),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("▶ {views}"), meta_style),
+                Span::styled(format!("   弹幕 {danmaku}"), meta_style),
+                Span::styled(format!("   评论 {replies}"), meta_style),
+                Span::styled(format!("   {duration}"), Style::default().fg(theme.success)),
             ]),
         ]);
 
         let info = Paragraph::new(info_text).wrap(Wrap { trim: true });
         frame.render_widget(info, info_area);
+    }
+}
+
+fn format_count(value: i64) -> String {
+    if value >= 10_000 {
+        format!("{:.1}万", value as f64 / 10_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_pane_switch_preempts_loading() {
+        let mut page = HomePage::new();
+        page.focus_sources = false;
+        page.loading = true;
+        let keys = Keybindings::default();
+        assert!(matches!(
+            page.handle_input(KeyCode::Left, &keys),
+            Some(AppAction::CancelPendingLoads)
+        ));
+        assert!(page.focus_sources);
+    }
+
+    #[test]
+    fn home_is_a_single_column_list() {
+        let page = HomePage::new();
+        assert_eq!(page.columns, 1);
+    }
+
+    #[test]
+    fn home_contains_search_source() {
+        let mut page = HomePage::new();
+        assert_eq!(page.source_count(), HomeFeed::ALL.len() + 1);
+        assert_eq!(page.feed(), HomeFeed::Recommended);
+        page.begin_search();
+        assert_eq!(page.selected_source, 0);
+        assert!(page.search.input_mode);
     }
 }

@@ -1,10 +1,8 @@
-use futures_util::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const REFRESH_SECS: i64 = 24 * 60 * 60;
@@ -44,8 +42,6 @@ struct CatalogCache {
     region: Option<Region>,
     hosts: Vec<String>,
 }
-
-static CATALOG_REFRESHING: AtomicBool = AtomicBool::new(false);
 
 fn cache_path() -> Option<PathBuf> {
     let mut path = dirs::config_dir()?;
@@ -157,74 +153,9 @@ pub(super) async fn regional_hosts(client: &Client) -> (Option<Region>, Vec<Stri
     }
     let region = cache.region;
     save_cache(&cache);
-    let hosts = cache
-        .hosts
-        .into_iter()
-        .filter(|host| match region {
-            Some(Region::MainlandChina) => !is_overseas_host(host),
-            Some(Region::Overseas) => is_overseas_host(host),
-            None => true,
-        })
-        .collect();
-    (region, hosts)
-}
-
-/// Resolve only the playback region without downloading the optional CDN
-/// catalog. Ranking uses API-authorized playurl hosts, so catalog refresh must
-/// not delay the playback hot path.
-pub(super) async fn playback_region(client: &Client) -> Option<Region> {
-    let now = chrono::Utc::now().timestamp();
-    let mut cache = load_cache();
-    if (now - cache.region_updated_at >= REFRESH_SECS || cache.region.is_none())
-        && let Some(region) = detect_region(client).await
-    {
-        cache.region = Some(region);
-        cache.region_updated_at = now;
-        save_cache(&cache);
-    }
-    let region = cache.region;
-    if (now - cache.updated_at >= REFRESH_SECS || cache.hosts.is_empty())
-        && CATALOG_REFRESHING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        let client = client.clone();
-        tokio::spawn(async move {
-            let mut latest = load_cache();
-            let mut hosts = BTreeSet::new();
-            hosts.extend(DOMESTIC.into_iter().map(str::to_string));
-            hosts.extend(OVERSEAS.into_iter().map(str::to_string));
-            for source in SOURCES {
-                if let Some(text) = fetch_catalog(&client, source).await {
-                    hosts.extend(extract_hosts(&text));
-                }
-            }
-            latest.hosts = hosts.into_iter().collect();
-            latest.updated_at = chrono::Utc::now().timestamp();
-            save_cache(&latest);
-            // Probe only the bare host: never attach a media path, cookie,
-            // signed query, or playurl token. Chunks bound network fan-out.
-            for hosts in latest.hosts.chunks(8) {
-                join_all(hosts.iter().cloned().map(|host| {
-                    let client = client.clone();
-                    async move {
-                        let started = std::time::Instant::now();
-                        let result = tokio::time::timeout(
-                            Duration::from_millis(1500),
-                            client.head(format!("https://{host}/")).send(),
-                        )
-                        .await;
-                        let latency = matches!(result, Ok(Ok(_))).then(|| started.elapsed());
-                        super::record_catalog_probe(&host, latency);
-                    }
-                }))
-                .await;
-            }
-            super::flush_catalog_probes();
-            CATALOG_REFRESHING.store(false, Ordering::Release);
-        });
-    }
-    region
+    // Return the complete catalog. The caller ranks same-region hosts higher,
+    // while retaining cross-region nodes as useful failure fallbacks.
+    (region, cache.hosts)
 }
 
 #[cfg(test)]

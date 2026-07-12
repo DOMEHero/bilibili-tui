@@ -125,6 +125,26 @@ pub struct LiveUrlInfo {
 }
 
 impl LivePlayInfoData {
+    /// Preserve Bilibili's own stream/format/codec order. This is the safest
+    /// default for playback; ranked alternatives are only failover choices.
+    pub fn default_stream_urls(&self) -> Vec<String> {
+        let Some(info) = &self.playurl_info else {
+            return Vec::new();
+        };
+        info.playurl
+            .stream
+            .iter()
+            .flat_map(|stream| &stream.format)
+            .flat_map(|format| &format.codec)
+            .flat_map(|codec| {
+                codec
+                    .url_info
+                    .iter()
+                    .map(|url| format!("{}{}{}", url.host, codec.base_url, url.extra))
+            })
+            .collect()
+    }
+
     pub fn highest_available_quality(&self) -> Option<i64> {
         self.playurl_info
             .as_ref()?
@@ -138,10 +158,39 @@ impl LivePlayInfoData {
     }
 
     pub fn stream_urls(&self) -> Vec<String> {
+        let highest = self.highest_available_quality();
+        let selected = highest
+            .map(|quality| self.stream_urls_for_quality(quality))
+            .unwrap_or_default();
+        if !selected.is_empty() {
+            return selected;
+        }
+
+        // Some unauthenticated or geo-restricted responses advertise higher
+        // values in `accept_qn` but return URLs only at the currently granted
+        // `current_qn`. Keep the best URL that the response actually contains
+        // instead of returning an empty list.
+        self.current_quality()
+            .map(|quality| self.stream_urls_for_quality(quality))
+            .unwrap_or_default()
+    }
+
+    fn current_quality(&self) -> Option<i64> {
+        self.playurl_info
+            .as_ref()?
+            .playurl
+            .stream
+            .iter()
+            .flat_map(|stream| &stream.format)
+            .flat_map(|format| &format.codec)
+            .map(|codec| codec.current_qn)
+            .max()
+    }
+
+    fn stream_urls_for_quality(&self, quality: i64) -> Vec<String> {
         let Some(info) = &self.playurl_info else {
             return Vec::new();
         };
-        let highest = self.highest_available_quality().unwrap_or_default();
         let mut choices = info
             .playurl
             .stream
@@ -149,7 +198,7 @@ impl LivePlayInfoData {
             .flat_map(|stream| {
                 stream.format.iter().flat_map(move |format| {
                     format.codec.iter().filter_map(move |codec| {
-                        (codec.current_qn == highest).then_some((
+                        (codec.current_qn == quality).then_some((
                             protocol_rank(&stream.protocol_name, &format.format_name),
                             codec_rank(&codec.codec_name),
                             codec,
@@ -173,9 +222,12 @@ impl LivePlayInfoData {
 
 fn protocol_rank(protocol: &str, format: &str) -> u8 {
     match (protocol, format) {
-        ("http_hls", "fmp4") => 0,
-        ("http_hls", "ts") => 1,
-        ("http_stream", "flv") => 2,
+        // MPV handles Bilibili's continuous FLV live stream more reliably
+        // than its short fMP4 playlists, which may surface as EOF every few
+        // seconds and force a visible reload.
+        ("http_stream", "flv") => 0,
+        ("http_hls", "fmp4") => 1,
+        ("http_hls", "ts") => 2,
         _ => 3,
     }
 }
@@ -239,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn live_play_info_uses_highest_quality_and_prefers_fmp4_avc() {
+    fn live_play_info_uses_highest_quality_and_prefers_avc() {
         let value = serde_json::json!({
             "live_status": 1,
             "playurl_info": {"playurl": {"stream": [{
@@ -254,6 +306,43 @@ mod tests {
         let data: LivePlayInfoData = serde_json::from_value(value).unwrap();
         assert_eq!(data.highest_available_quality(), Some(20000));
         assert_eq!(data.stream_urls(), ["https://cdn.example/best?token=1"]);
+    }
+
+    #[test]
+    fn live_play_info_prefers_continuous_flv_for_mpv() {
+        let value = serde_json::json!({
+            "live_status": 1,
+            "playurl_info": {"playurl": {"stream": [
+                {"protocol_name": "http_hls", "format": [{"format_name": "fmp4", "codec": [{
+                    "codec_name": "avc", "current_qn": 10000, "accept_qn": [10000],
+                    "base_url": "/hls", "url_info": [{"host": "https://hls", "extra": ""}]
+                }]}]},
+                {"protocol_name": "http_stream", "format": [{"format_name": "flv", "codec": [{
+                    "codec_name": "avc", "current_qn": 10000, "accept_qn": [10000],
+                    "base_url": "/live.flv", "url_info": [{"host": "https://flv", "extra": ""}]
+                }]}]}
+            ]}}
+        });
+        let data: LivePlayInfoData = serde_json::from_value(value).unwrap();
+        assert_eq!(data.stream_urls()[0], "https://flv/live.flv");
+    }
+
+    #[test]
+    fn live_play_info_falls_back_to_granted_quality_when_requested_quality_is_unavailable() {
+        let value = serde_json::json!({
+            "live_status": 1,
+            "playurl_info": {"playurl": {"stream": [{
+                "protocol_name": "http_hls",
+                "format": [{"format_name": "fmp4", "codec": [{
+                    "codec_name": "avc", "current_qn": 400,
+                    "accept_qn": [10000, 400], "base_url": "/granted?",
+                    "url_info": [{"host": "https://cdn.example", "extra": "token=2"}]
+                }]}]
+            }]}}
+        });
+        let data: LivePlayInfoData = serde_json::from_value(value).unwrap();
+        assert_eq!(data.highest_available_quality(), Some(10000));
+        assert_eq!(data.stream_urls(), ["https://cdn.example/granted?token=2"]);
     }
 }
 

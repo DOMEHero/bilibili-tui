@@ -334,23 +334,6 @@ fn record_probe_failure(host: &str) {
     }
 }
 
-fn record_catalog_probe(host: &str, latency: Option<Duration>) {
-    if let Ok(mut values) = history().lock() {
-        let entry = values.entry(host.to_string()).or_default();
-        entry.catalog_reachable = Some(latency.is_some());
-        entry.catalog_latency_ms = latency.map(|value| value.as_secs_f64() * 1000.0);
-        entry.catalog_probed_at = chrono::Utc::now().timestamp();
-        save_history(&values);
-    }
-}
-
-fn flush_catalog_probes() {
-    let snapshot = history().lock().ok().map(|values| values.clone());
-    if let Some(values) = snapshot {
-        save_history_durable(values);
-    }
-}
-
 fn catalog_prior(host: &str) -> Option<f64> {
     let value = history().lock().ok()?.get(host).cloned()?;
     match value.catalog_reachable {
@@ -489,6 +472,7 @@ async fn rank_urls(
     stream: &DashStream,
     kind: StreamKind,
     region: Option<catalog::Region>,
+    catalog_hosts: &[String],
 ) -> Result<Vec<CdnCandidate>> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(800))
@@ -500,10 +484,19 @@ async fn rank_urls(
     let primary = stream
         .primary_url()
         .ok_or_else(|| anyhow!("CDN 流缺少主地址"))?;
-    // Only playurl-provided URLs are authorized. Replacing the host of a
-    // signed URL leaks its token and is not guaranteed to remain valid.
     urls.push(primary.to_string());
     urls.extend(stream.backup_urls().cloned());
+    // Bilibili UPOS signatures belong to the media path/query and can be used
+    // with another UPOS edge. Preserve every signed component and replace only
+    // the host so catalog nodes participate in real media probing.
+    if let Ok(template) = reqwest::Url::parse(primary) {
+        for catalog_host in catalog_hosts {
+            let mut rewritten = template.clone();
+            if rewritten.set_host(Some(catalog_host)).is_ok() {
+                urls.push(rewritten.to_string());
+            }
+        }
+    }
     urls.sort_by_key(|url| host(url));
     urls.dedup_by(|a, b| host(a) == host(b));
 
@@ -582,10 +575,10 @@ pub async fn rank_streams(data: &PlayUrlData) -> Result<RankedStreams> {
     let region_client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(800))
         .build()?;
-    let region = catalog::playback_region(&region_client).await;
+    let (region, catalog_hosts) = catalog::regional_hosts(&region_client).await;
     let (video, audio) = tokio::join!(
-        rank_urls(video, StreamKind::Video, region),
-        rank_urls(audio, StreamKind::Audio, region)
+        rank_urls(video, StreamKind::Video, region, &catalog_hosts),
+        rank_urls(audio, StreamKind::Audio, region, &catalog_hosts)
     );
     Ok(RankedStreams {
         video: video?,

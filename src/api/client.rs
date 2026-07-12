@@ -437,81 +437,78 @@ impl ApiClient {
             .and_then(|l| l.as_array())
             .cloned()
             .unwrap_or_default();
+        Ok(parse_home_videos(list))
+    }
 
-        let videos = list
-            .into_iter()
-            .filter_map(|item| {
-                let bvid = item
-                    .get("bvid")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned);
-                let aid = item
-                    .get("aid")
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| item.get("id").and_then(|v| v.as_i64()))
+    pub async fn get_home_feed(
+        &self,
+        feed: super::recommend::HomeFeed,
+        page: i32,
+        page_size: i32,
+    ) -> Result<Vec<super::recommend::VideoItem>> {
+        use super::recommend::HomeFeed;
+        let path = match feed {
+            HomeFeed::Recommended => {
+                // The authenticated homepage recommendation is selected by the
+                // network worker; this fallback keeps the public helper useful
+                // for callers without a login context.
+                return self.get_popular_videos(page, page_size).await;
+            }
+            HomeFeed::Popular => {
+                return self.get_popular_videos(page, page_size).await;
+            }
+            HomeFeed::Weekly => {
+                let list_url = format!(
+                    "{}/x/web-interface/popular/series/list",
+                    BilibiliApiDomain::Main.as_str()
+                );
+                let list: ApiResponse<serde_json::Value> = self
+                    .get_with_wbi(&list_url, vec![("web_location", "333.934".to_string())])
+                    .await?;
+                let number = list
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("list"))
+                    .and_then(|list| list.as_array())
+                    .and_then(|list| list.first())
+                    .and_then(|item| item.get("number"))
+                    .and_then(|number| number.as_i64())
+                    .ok_or_else(|| anyhow!("每周必看期数为空"))?;
+                let one_url = format!(
+                    "{}/x/web-interface/popular/series/one",
+                    BilibiliApiDomain::Main.as_str()
+                );
+                let value: ApiResponse<serde_json::Value> = self
+                    .get_with_wbi(
+                        &one_url,
+                        vec![
+                            ("number", number.to_string()),
+                            ("web_location", "333.934".to_string()),
+                        ],
+                    )
+                    .await?;
+                let list = value
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("list"))
+                    .and_then(|list| list.as_array())
+                    .cloned()
                     .unwrap_or_default();
-
-                if bvid.is_none() || aid <= 0 {
-                    return None;
-                }
-
-                let owner = item.get("owner").and_then(|o| {
-                    let mid = o.get("mid").and_then(|v| v.as_i64()).unwrap_or_default();
-                    let name = o
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("-")
-                        .to_string();
-                    if mid == 0 && name == "-" {
-                        None
-                    } else {
-                        Some(super::recommend::VideoOwner {
-                            mid,
-                            name,
-                            face: o
-                                .get("face")
-                                .and_then(|v| v.as_str())
-                                .map(ToOwned::to_owned),
-                        })
-                    }
-                });
-
-                let stat = item.get("stat").map(|s| super::recommend::VideoStat {
-                    view: s.get("view").and_then(|v| v.as_i64()),
-                    like: s.get("like").and_then(|v| v.as_i64()),
-                    danmaku: s.get("danmaku").and_then(|v| v.as_i64()),
-                });
-
-                Some(super::recommend::VideoItem {
-                    id: aid,
-                    bvid,
-                    cid: item.get("cid").and_then(|v| v.as_i64()),
-                    goto: item
-                        .get("goto")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("av")
-                        .to_string(),
-                    uri: item
-                        .get("uri")
-                        .and_then(|v| v.as_str())
-                        .map(ToOwned::to_owned),
-                    pic: item
-                        .get("pic")
-                        .and_then(|v| v.as_str())
-                        .map(ToOwned::to_owned),
-                    title: item
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .map(ToOwned::to_owned),
-                    duration: item.get("duration").and_then(|v| v.as_i64()),
-                    pubdate: item.get("pubdate").and_then(|v| v.as_i64()),
-                    owner,
-                    stat,
-                })
-            })
-            .collect();
-
-        Ok(videos)
+                return Ok(parse_home_videos(list));
+            }
+            HomeFeed::Ranking => "/x/web-interface/ranking/v2?rid=0&type=all".to_string(),
+            HomeFeed::MustWatch => "/x/web-interface/popular/precious".to_string(),
+        };
+        let url = format!("{}{}", BilibiliApiDomain::Main.as_str(), path);
+        let value: ApiResponse<serde_json::Value> = self.get(&url).await?;
+        let list = value
+            .data
+            .as_ref()
+            .and_then(|data| data.get("list"))
+            .and_then(|list| list.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(parse_home_videos(list))
     }
 
     // Video API
@@ -1300,6 +1297,18 @@ impl ApiClient {
         Ok(urls)
     }
 
+    pub async fn get_default_live_stream_urls(&self, room_id: i64) -> Result<Vec<String>> {
+        let info = self.get_live_play_info(room_id, 0).await?;
+        if info.live_status != 1 {
+            return Err(anyhow!("直播间当前未开播"));
+        }
+        let urls = info.default_stream_urls();
+        if urls.is_empty() {
+            return Err(anyhow!("直播默认播放地址为空"));
+        }
+        Ok(urls)
+    }
+
     /// Get live room info
     pub async fn get_live_room_info(&self, room_id: i64) -> Result<super::live::LiveRoomInfo> {
         let url = format!(
@@ -1385,6 +1394,18 @@ impl ApiClient {
         }
     }
 
+    pub async fn get_buvid3(&self) -> Result<String> {
+        let url = "https://api.bilibili.com/x/frontend/finger/spi";
+        let response: ApiResponse<serde_json::Value> = self.get(url).await?;
+        response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("b_3"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("buvid3 响应为空"))
+    }
+
     /// Get live room history danmaku
     pub async fn get_history_danmaku(
         &self,
@@ -1414,6 +1435,14 @@ impl ApiClient {
         api_resp.data.ok_or_else(|| anyhow::anyhow!("响应无数据"))
     }
 }
+fn parse_home_videos(items: Vec<serde_json::Value>) -> Vec<super::recommend::VideoItem> {
+    items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<super::recommend::VideoItem>(item).ok())
+        .filter(|video| video.id > 0 && video.bvid.is_some())
+        .collect()
+}
+
 impl Default for ApiClient {
     fn default() -> Self {
         Self::new()

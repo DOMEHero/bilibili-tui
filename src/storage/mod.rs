@@ -89,6 +89,9 @@ pub struct Keybindings {
     pub nav_right: String,
     pub nav_next_page: String,
     pub nav_prev_page: String,
+    /// Move the focused content list by one viewport.
+    pub page_down: String,
+    pub page_up: String,
 
     // Section/Tab navigation
     pub section_prev: String,
@@ -128,6 +131,8 @@ impl Default for Keybindings {
             nav_right: "l".to_string(),
             nav_next_page: "Tab".to_string(),
             nav_prev_page: "BackTab".to_string(),
+            page_down: "PageDown".to_string(),
+            page_up: "PageUp".to_string(),
 
             // Section/Tab
             section_prev: "[".to_string(),
@@ -276,6 +281,14 @@ impl Keybindings {
         self.matches(&self.nav_prev_page, key)
     }
 
+    pub fn matches_page_down(&self, key: KeyCode) -> bool {
+        self.matches(&self.page_down, key)
+    }
+
+    pub fn matches_page_up(&self, key: KeyCode) -> bool {
+        self.matches(&self.page_up, key)
+    }
+
     pub fn matches_next_theme(&self, key: KeyCode) -> bool {
         self.matches(&self.next_theme, key)
     }
@@ -354,6 +367,8 @@ impl Keybindings {
             ("向右", &self.nav_right),
             ("下一页面", &self.nav_next_page),
             ("上一页面", &self.nav_prev_page),
+            ("内容下翻页", &self.page_down),
+            ("内容上翻页", &self.page_up),
             // Section/Tab
             ("上一分区", &self.section_prev),
             ("下一分区", &self.section_next),
@@ -389,33 +404,74 @@ impl Keybindings {
             7 => self.nav_right = new_key,
             8 => self.nav_next_page = new_key,
             9 => self.nav_prev_page = new_key,
+            10 => self.page_down = new_key,
+            11 => self.page_up = new_key,
             // Section/Tab
-            10 => self.section_prev = new_key,
-            11 => self.section_next = new_key,
-            12 => self.tab_1 = new_key,
-            13 => self.tab_2 = new_key,
-            14 => self.tab_3 = new_key,
+            12 => self.section_prev = new_key,
+            13 => self.section_next = new_key,
+            14 => self.tab_1 = new_key,
+            15 => self.tab_2 = new_key,
+            16 => self.tab_3 = new_key,
             // Actions
-            15 => self.next_theme = new_key,
-            16 => self.play = new_key,
-            17 => self.open_settings = new_key,
-            18 => self.search_focus = new_key,
+            17 => self.next_theme = new_key,
+            18 => self.play = new_key,
+            19 => self.open_settings = new_key,
+            20 => self.search_focus = new_key,
             // Comments
-            19 => self.comment = new_key,
-            20 => self.toggle_replies = new_key,
+            21 => self.comment = new_key,
+            22 => self.toggle_replies = new_key,
             // Dynamic page
-            21 => self.up_prev = new_key,
-            22 => self.up_next = new_key,
+            23 => self.up_prev = new_key,
+            24 => self.up_next = new_key,
             _ => {}
         }
     }
 }
 
 /// Application configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DanmakuConfig {
+    pub enabled: bool,
+    pub display_area: f64,
+    pub opacity: f64,
+    pub font_scale: f64,
+    pub duration: f64,
+    pub stroke_width: f64,
+    pub line_height: f64,
+    pub massive_mode: bool,
+    pub font_family: String,
+}
+
+impl Default for DanmakuConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            display_area: 0.5,
+            opacity: 1.0,
+            font_scale: 1.0,
+            duration: 7.0,
+            stroke_width: if cfg!(target_os = "macos") { 2.0 } else { 2.5 },
+            line_height: 1.6,
+            massive_mode: false,
+            font_family: if cfg!(target_os = "macos") {
+                "Yuanti SC"
+            } else if cfg!(target_os = "windows") {
+                "Microsoft YaHei UI"
+            } else {
+                "Noto Sans CJK SC"
+            }
+            .to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub theme: String,
     pub keybindings: Keybindings,
+    #[serde(default)]
+    pub danmaku: DanmakuConfig,
 }
 
 impl Default for AppConfig {
@@ -423,6 +479,7 @@ impl Default for AppConfig {
         Self {
             theme: "silkcircuit-neon".to_string(),
             keybindings: Keybindings::default(),
+            danmaku: DanmakuConfig::default(),
         }
     }
 }
@@ -527,5 +584,32 @@ pub fn remove_cookie_export(path: &std::path::Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_receives_default_danmaku_settings() {
+        let value = serde_json::json!({
+            "theme": "silkcircuit-neon",
+            "keybindings": Keybindings::default(),
+        });
+        let config: AppConfig = serde_json::from_value(value).expect("legacy config");
+        assert_eq!(config.danmaku, DanmakuConfig::default());
+    }
+
+    #[test]
+    fn platform_default_danmaku_font_is_explicit() {
+        let font = DanmakuConfig::default().font_family;
+        if cfg!(target_os = "macos") {
+            assert_eq!(font, "Yuanti SC");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(font, "Microsoft YaHei UI");
+        } else {
+            assert_eq!(font, "Noto Sans CJK SC");
+        }
     }
 }

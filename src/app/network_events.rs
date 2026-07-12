@@ -11,28 +11,38 @@ impl App {
 
     fn handle_network_event(&mut self, event: network::NetworkEvent) {
         match event {
-            network::NetworkEvent::HomeLoaded { req_id, videos } => {
+            network::NetworkEvent::HomeLoaded {
+                req_id,
+                feed,
+                videos,
+            } => {
                 if !self.is_latest_request("home", req_id) {
                     return;
                 }
                 if let Page::Home(page) = &mut self.current_page {
-                    page.apply_recommendations(videos);
+                    page.apply_recommendations(feed, videos);
                 }
             }
-            network::NetworkEvent::HomeMoreLoaded { req_id, videos } => {
+            network::NetworkEvent::HomeMoreLoaded {
+                req_id,
+                feed,
+                videos,
+            } => {
                 if !self.is_latest_request("home_more", req_id) {
                     return;
                 }
                 if let Page::Home(page) = &mut self.current_page {
-                    page.apply_load_more(videos);
+                    page.apply_load_more(feed, videos);
                 }
             }
             network::NetworkEvent::HotwordsLoaded { req_id, hotwords } => {
                 if !self.is_latest_request("hotwords", req_id) {
                     return;
                 }
-                if let Page::Search(page) = &mut self.current_page {
-                    page.set_hotwords(hotwords);
+                match &mut self.current_page {
+                    Page::Home(page) => page.search_mut().set_hotwords(hotwords),
+                    Page::Search(page) => page.set_hotwords(hotwords),
+                    _ => {}
                 }
             }
             network::NetworkEvent::SearchLoaded {
@@ -45,18 +55,35 @@ impl App {
                 if !self.is_latest_request("search", req_id) {
                     return;
                 }
-                if let Page::Search(search_page) = &mut self.current_page {
-                    if search_page.query != keyword {
-                        return;
+                match &mut self.current_page {
+                    Page::Home(home_page) => {
+                        let search_page = home_page.search_mut();
+                        if search_page.query != keyword {
+                            return;
+                        }
+                        if page <= 1 {
+                            search_page.page = 1;
+                            search_page.set_results(results, total);
+                        } else {
+                            search_page.page = page;
+                            search_page.total_results = total;
+                            search_page.append_results(results);
+                        }
                     }
-                    if page <= 1 {
-                        search_page.page = 1;
-                        search_page.set_results(results, total);
-                    } else {
-                        search_page.page = page;
-                        search_page.total_results = total;
-                        search_page.append_results(results);
+                    Page::Search(search_page) => {
+                        if search_page.query != keyword {
+                            return;
+                        }
+                        if page <= 1 {
+                            search_page.page = 1;
+                            search_page.set_results(results, total);
+                        } else {
+                            search_page.page = page;
+                            search_page.total_results = total;
+                            search_page.append_results(results);
+                        }
                     }
+                    _ => {}
                 }
             }
             network::NetworkEvent::DynamicLoaded {
@@ -368,8 +395,14 @@ impl App {
                         page.apply_recommendations_error(format!("加载推荐视频失败: {}", error))
                     }
                     (Page::Home(page), "home_more") => page.apply_load_more_error(),
+                    (Page::Home(page), "hotwords") => page
+                        .search_mut()
+                        .set_hotword_error(format!("加载热搜失败: {}", error)),
                     (Page::Search(page), "hotwords") => {
                         page.set_hotword_error(format!("加载热搜失败: {}", error))
+                    }
+                    (Page::Home(page), "search") => {
+                        page.search_mut().set_error(format!("搜索失败: {}", error))
                     }
                     (Page::Search(page), "search") => {
                         page.set_error(format!("搜索失败: {}", error))

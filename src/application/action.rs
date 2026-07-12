@@ -1,8 +1,9 @@
 use crate::api::favorite::{FavoriteOrder, FavoriteSource};
+use crate::api::recommend::HomeFeed;
 use crate::api::space::SpaceVideoOrder;
 use crate::api::video::VideoPage;
 use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
-use crate::infrastructure::persistence::{Credentials, Keybindings};
+use crate::infrastructure::persistence::{Credentials, DanmakuConfig, Keybindings};
 use crate::presentation::tui::DynamicTab;
 
 /// Actions that can be triggered from UI components
@@ -14,6 +15,7 @@ pub enum AppAction {
     SwitchToHome,
     /// Refresh home page recommendations (force reload)
     RefreshHome,
+    SwitchHomeFeed(HomeFeed),
     /// Switch to login page
     SwitchToLogin,
     /// Switch to settings page
@@ -58,6 +60,7 @@ pub enum AppAction {
     NavNext,
     /// Navigate to previous sidebar item
     NavPrev,
+    CancelPendingLoads,
     /// Search for videos
     Search(String),
     /// Refresh dynamic feed
@@ -100,6 +103,8 @@ pub enum AppAction {
     SetTheme(String),
     /// Save keybindings to config
     SaveKeybindings(Box<Keybindings>),
+    /// Save live/video danmaku rendering settings.
+    SaveDanmakuConfig(Box<DanmakuConfig>),
     /// Logout and return to login page
     Logout,
     /// Like or unlike a comment (oid, rpid, comment_type)

@@ -35,7 +35,7 @@ impl SearchPage {
     pub fn new() -> Self {
         Self {
             query: String::new(),
-            grid: VideoCardGrid::new(),
+            grid: VideoCardGrid::new_list(),
             loading: false,
             error_message: None,
             input_mode: true,
@@ -377,9 +377,11 @@ impl Component for SearchPage {
             )
         } else {
             format!(
-                "[{}/{}] 导航  [{}] 详情  [{}] 搜索  [{}] 切换",
+                "[{}/{}] 导航  [{}/{}] 翻页  [{}] 详情  [{}] 搜索  [{}] 切换",
                 keys.get_arrow_keys_display(),
                 keys.get_nav_keys_display(),
+                keys.page_up,
+                keys.page_down,
                 keys.confirm,
                 keys.search_focus,
                 keys.nav_next_page
@@ -490,6 +492,17 @@ impl Component for SearchPage {
             }
             Some(AppAction::None)
         } else {
+            if keys.matches_page_down(key) {
+                self.grid.move_page_down();
+                if self.grid.is_near_bottom(self.grid.cached_visible_rows) && !self.loading_more {
+                    return Some(AppAction::LoadMoreSearch);
+                }
+                return Some(AppAction::None);
+            }
+            if keys.matches_page_up(key) {
+                self.grid.move_page_up();
+                return Some(AppAction::None);
+            }
             if keys.matches_down(key) {
                 self.grid.move_down();
                 // Check for pagination

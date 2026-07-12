@@ -11,7 +11,7 @@ use crate::api::{
     history::HistoryCursor,
     history::HistoryData,
     live::LiveRoom,
-    recommend::VideoItem,
+    recommend::{HomeFeed, VideoItem},
     search::HotwordItem,
     search::SearchVideoItem,
     space::{RelationStat, SpaceInfo, SpaceVideoData, SpaceVideoOrder},
@@ -20,17 +20,22 @@ use crate::api::{
 };
 use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
 use crate::presentation::tui::DynamicTab;
+use futures_util::{StreamExt, stream};
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
 #[derive(Debug)]
 pub enum NetworkCommand {
+    CancelPending,
     LoadHome {
         req_id: u64,
+        feed: HomeFeed,
         use_guest_feed: bool,
     },
     LoadHomeMore {
         req_id: u64,
         fresh_idx: i32,
+        feed: HomeFeed,
         use_guest_feed: bool,
     },
     LoadHotwords {
@@ -134,10 +139,12 @@ pub enum NetworkCommand {
 pub enum NetworkEvent {
     HomeLoaded {
         req_id: u64,
+        feed: HomeFeed,
         videos: Vec<VideoItem>,
     },
     HomeMoreLoaded {
         req_id: u64,
+        feed: HomeFeed,
         videos: Vec<VideoItem>,
     },
     HotwordsLoaded {
@@ -277,12 +284,29 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
                 Err(_) => return,
             };
 
+            let mut cancellations =
+                HashMap::<&'static str, tokio_util::sync::CancellationToken>::new();
             while let Ok(command) = command_rx.recv() {
+                if matches!(command, NetworkCommand::CancelPending) {
+                    for (_, token) in cancellations.drain() {
+                        token.cancel();
+                    }
+                    continue;
+                }
+                let key = command.cancel_key();
+                let token = tokio_util::sync::CancellationToken::new();
+                if let Some(previous) = cancellations.insert(key, token.clone()) {
+                    previous.cancel();
+                }
                 let api_client = api_client.clone();
                 let event_tx = event_tx.clone();
                 runtime.spawn(async move {
-                    let event = handle_command(api_client, command).await;
-                    let _ = event_tx.send(event);
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        event = handle_command(api_client, command) => {
+                            let _ = event_tx.send(event);
+                        }
+                    }
                 });
             }
         })
@@ -294,30 +318,80 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
     }
 }
 
+impl NetworkCommand {
+    fn cancel_key(&self) -> &'static str {
+        match self {
+            Self::LoadHome { .. } | Self::LoadHomeMore { .. } => "home",
+            Self::LoadFavoriteResources { .. }
+            | Self::LoadFavoritesInit { .. }
+            | Self::LoadFavoritesContent { .. } => "favorites",
+            Self::BuildUpPlaylist { .. } | Self::BuildFavoritePlaylist { .. } => "playlist",
+            Self::CancelPending => "cancel",
+            Self::LoadHotwords { .. } | Self::Search { .. } => "search",
+            Self::LoadDynamicInit { .. }
+            | Self::LoadDynamicRefresh { .. }
+            | Self::LoadDynamicMore { .. } => "dynamic",
+            Self::LoadHistoryInit { .. } | Self::LoadHistoryMore { .. } => "history",
+            Self::LoadLiveInit { .. } | Self::LoadLiveMore { .. } => "live",
+            Self::LoadVideoDetail { .. } => "video_detail",
+            Self::LoadUpPage { .. } | Self::LoadUpVideos { .. } => "up",
+            Self::LoadDynamicDetail { .. } => "dynamic_detail",
+            Self::LoadBangumiIndex { .. } | Self::LoadBangumiDetail { .. } => "bangumi",
+        }
+    }
+}
+
 async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> NetworkEvent {
     match command {
+        NetworkCommand::CancelPending => unreachable!("handled by worker"),
         NetworkCommand::LoadHome {
             req_id,
+            feed,
             use_guest_feed,
-        } => match if use_guest_feed {
-            api_client.get_popular_videos(1, 20).await
-        } else {
-            api_client.get_recommendations().await
-        } {
-            Ok(videos) => NetworkEvent::HomeLoaded { req_id, videos },
-            Err(e) => failed(req_id, "home", e),
-        },
+        } => {
+            let result = match (feed, use_guest_feed) {
+                (HomeFeed::Recommended, false) => api_client.get_recommendations().await,
+                (HomeFeed::Recommended, true) | (HomeFeed::Popular, _) => {
+                    api_client.get_popular_videos(1, 20).await
+                }
+                _ => api_client.get_home_feed(feed, 1, 20).await,
+            };
+            match result {
+                Ok(mut videos) => {
+                    enrich_followers(&api_client, &mut videos).await;
+                    NetworkEvent::HomeLoaded {
+                        req_id,
+                        feed,
+                        videos,
+                    }
+                }
+                Err(e) => failed(req_id, "home", e),
+            }
+        }
         NetworkCommand::LoadHomeMore {
             req_id,
             fresh_idx,
+            feed,
             use_guest_feed,
         } => {
-            match if use_guest_feed {
-                api_client.get_popular_videos(fresh_idx, 20).await
-            } else {
-                api_client.get_recommendations_paged(fresh_idx).await
-            } {
-                Ok(videos) => NetworkEvent::HomeMoreLoaded { req_id, videos },
+            let result = match (feed, use_guest_feed) {
+                (HomeFeed::Recommended, false) => {
+                    api_client.get_recommendations_paged(fresh_idx).await
+                }
+                (HomeFeed::Recommended, true) | (HomeFeed::Popular, _) => {
+                    api_client.get_popular_videos(fresh_idx, 20).await
+                }
+                _ => api_client.get_home_feed(feed, fresh_idx, 20).await,
+            };
+            match result {
+                Ok(mut videos) => {
+                    enrich_followers(&api_client, &mut videos).await;
+                    NetworkEvent::HomeMoreLoaded {
+                        req_id,
+                        feed,
+                        videos,
+                    }
+                }
                 Err(e) => failed(req_id, "home_more", e),
             }
         }
@@ -747,6 +821,34 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
                 },
                 Err(e) => failed(req_id, "bangumi_detail", e),
             }
+        }
+    }
+}
+
+async fn enrich_followers(api_client: &Arc<ApiClient>, videos: &mut [VideoItem]) {
+    let mids = videos
+        .iter()
+        .filter_map(|video| video.owner.as_ref().map(|owner| owner.mid))
+        .filter(|mid| *mid > 0)
+        .collect::<std::collections::BTreeSet<_>>();
+    let followers = stream::iter(mids)
+        .map(|mid| {
+            let client = Arc::clone(api_client);
+            async move {
+                let follower = client
+                    .get_relation_stat(mid)
+                    .await
+                    .ok()
+                    .and_then(|stat| stat.follower);
+                (mid, follower)
+            }
+        })
+        .buffer_unordered(6)
+        .collect::<HashMap<_, _>>()
+        .await;
+    for video in videos {
+        if let Some(owner) = video.owner.as_mut() {
+            owner.follower = followers.get(&owner.mid).copied().flatten();
         }
     }
 }

@@ -25,7 +25,12 @@ pub struct LiveClient {
 
 impl LiveClient {
     /// Connect to live room WebSocket
-    pub async fn connect(room_id: i64, uid: i64, danmu_info: &DanmuInfoData) -> Result<Self> {
+    pub async fn connect(
+        room_id: i64,
+        uid: i64,
+        buvid: String,
+        danmu_info: &DanmuInfoData,
+    ) -> Result<Self> {
         let urls = danmu_info
             .host_list
             .iter()
@@ -51,6 +56,7 @@ impl LiveClient {
                 room_id,
                 uid,
                 &token,
+                &buvid,
                 message_tx,
                 &mut shutdown_rx,
                 task_error,
@@ -96,6 +102,7 @@ async fn run_connections(
     room_id: i64,
     uid: i64,
     token: &str,
+    buvid: &str,
     message_tx: mpsc::Sender<LiveMessage>,
     shutdown_rx: &mut mpsc::Receiver<()>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -109,6 +116,7 @@ async fn run_connections(
                 room_id,
                 uid,
                 token,
+                buvid,
                 message_tx.clone(),
                 shutdown_rx,
                 &connection_state,
@@ -148,11 +156,13 @@ impl Drop for LiveClient {
 }
 
 /// Run WebSocket connection loop
+#[allow(clippy::too_many_arguments)]
 async fn run_connection(
     url: &str,
     room_id: i64,
     uid: i64,
     token: &str,
+    buvid: &str,
     message_tx: mpsc::Sender<LiveMessage>,
     shutdown_rx: &mut mpsc::Receiver<()>,
     connection_state: &AtomicU8,
@@ -164,9 +174,8 @@ async fn run_connection(
     let (mut write, mut read) = ws_stream.split();
 
     // Send auth packet
-    let auth_packet = make_auth_packet(room_id, uid, token);
+    let auth_packet = make_auth_packet(room_id, uid, token, buvid);
     write.send(Message::Binary(auth_packet.into())).await?;
-    connection_state.store(1, Ordering::Release);
 
     // Heartbeat interval (30 seconds)
     let mut heartbeat_interval = interval(Duration::from_secs(30));
@@ -191,7 +200,12 @@ async fn run_connection(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        let _ = process_message(&data[..], &message_tx).await;
+                        if let Some(code) = process_message(&data[..], &message_tx).await? {
+                            if code != 0 {
+                                return Err(anyhow!("live authentication failed: {code}"));
+                            }
+                            connection_state.store(1, Ordering::Release);
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         break;
@@ -209,17 +223,24 @@ async fn run_connection(
 }
 
 /// Process received WebSocket message
-async fn process_message(data: &[u8], message_tx: &mpsc::Sender<LiveMessage>) -> Result<()> {
+async fn process_message(
+    data: &[u8],
+    message_tx: &mpsc::Sender<LiveMessage>,
+) -> Result<Option<i32>> {
     let packets = Packet::decode(data)?;
+    let mut auth_code = None;
 
     for packet in packets {
         if let Some(msg) = parse_message(&packet) {
+            if let LiveMessage::AuthReply { code } = msg {
+                auth_code = Some(code);
+            }
             // Send message (ignore if channel is full)
             let _ = message_tx.try_send(msg);
         }
     }
 
-    Ok(())
+    Ok(auth_code)
 }
 
 #[cfg(test)]

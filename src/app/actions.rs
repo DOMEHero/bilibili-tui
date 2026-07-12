@@ -6,6 +6,7 @@ use crate::presentation::tui::{
     HomePage, LiveDetailPage, LivePage, LoginPage, NavItem, Page, SearchPage, SettingsPage, Theme,
     UpPage,
 };
+use std::sync::Arc;
 
 impl App {
     fn login_required_message() -> String {
@@ -65,6 +66,20 @@ impl App {
                 self.cached_home = None;
                 self.current_page = Page::Home(HomePage::new());
                 self.init_current_page().await;
+            }
+            AppAction::SwitchHomeFeed(feed) => {
+                let req_id = self.next_request_id("home");
+                // Invalidate any pending pagination result before switching.
+                self.next_request_id("home_more");
+                let use_guest_feed = self.credentials.is_none();
+                if let Page::Home(page) = &mut self.current_page {
+                    page.begin_feed_load(feed);
+                    self.send_network_command(network::NetworkCommand::LoadHome {
+                        req_id,
+                        feed,
+                        use_guest_feed,
+                    });
+                }
             }
             AppAction::SwitchToLogin => {
                 self.current_page = Page::Login(LoginPage::new());
@@ -196,6 +211,7 @@ impl App {
                 });
             }
             AppAction::NavNext => {
+                self.send_network_command(network::NetworkCommand::CancelPending);
                 // Don't navigate if on video detail page
                 if !matches!(self.current_page, Page::VideoDetail(_)) {
                     self.sidebar.next();
@@ -203,17 +219,36 @@ impl App {
                 }
             }
             AppAction::NavPrev => {
+                self.send_network_command(network::NetworkCommand::CancelPending);
                 if !matches!(self.current_page, Page::VideoDetail(_)) {
                     self.sidebar.prev();
                     self.switch_to_nav_page().await;
                 }
             }
+            AppAction::CancelPendingLoads => {
+                self.send_network_command(network::NetworkCommand::CancelPending);
+            }
             AppAction::Search(keyword) => {
-                if let Page::Search(page) = &mut self.current_page {
-                    page.query = keyword.clone();
-                    page.page = 1;
-                    page.loading = true;
-                    page.show_hot_list = false;
+                let mut start_search = false;
+                match &mut self.current_page {
+                    Page::Home(home) => {
+                        let page = home.search_mut();
+                        page.query = keyword.clone();
+                        page.page = 1;
+                        page.loading = true;
+                        page.show_hot_list = false;
+                        start_search = true;
+                    }
+                    Page::Search(page) => {
+                        page.query = keyword.clone();
+                        page.page = 1;
+                        page.loading = true;
+                        page.show_hot_list = false;
+                        start_search = true;
+                    }
+                    _ => {}
+                }
+                if start_search {
                     let req_id = self.next_request_id("search");
                     self.send_network_command(network::NetworkCommand::Search {
                         req_id,
@@ -434,8 +469,11 @@ impl App {
                         }
                     }
                     Some(PreviousPage::Search) => {
-                        self.sidebar.select(NavItem::Search);
-                        self.current_page = Page::Search(SearchPage::new());
+                        // Search now lives inside Home; return there with the search pane open.
+                        self.sidebar.select(NavItem::Home);
+                        let mut home = self.cached_home.take().unwrap_or_default();
+                        home.begin_search();
+                        self.current_page = Page::Home(home);
                         self.init_current_page().await;
                     }
                     Some(PreviousPage::Dynamic) => {
@@ -486,29 +524,47 @@ impl App {
                 }
             }
             AppAction::LoadMoreRecommendations => {
-                if let Page::Home(page) = &mut self.current_page
-                    && let Some(fresh_idx) = page.begin_load_more()
-                {
+                let request = if let Page::Home(page) = &mut self.current_page {
+                    page.begin_load_more()
+                        .map(|fresh_idx| (fresh_idx, page.feed()))
+                } else {
+                    None
+                };
+                if let Some((fresh_idx, feed)) = request {
                     let req_id = self.next_request_id("home_more");
                     self.send_network_command(network::NetworkCommand::LoadHomeMore {
                         req_id,
                         fresh_idx,
+                        feed,
                         use_guest_feed: self.credentials.is_none(),
                     });
                 }
             }
             AppAction::LoadMoreSearch => {
                 let mut command = None;
-                if let Page::Search(page) = &mut self.current_page {
-                    if page.loading_more || page.query.is_empty() || page.show_hot_list {
-                        return;
+                match &mut self.current_page {
+                    Page::Home(home) => {
+                        let page = home.search_mut();
+                        if page.loading_more || page.query.is_empty() || page.show_hot_list {
+                            return;
+                        }
+                        if page.grid.cards.len() >= page.total_results as usize {
+                            return;
+                        }
+                        page.loading_more = true;
+                        command = Some((page.query.clone(), page.page + 1));
                     }
-                    if page.grid.cards.len() >= page.total_results as usize {
-                        return;
+                    Page::Search(page) => {
+                        if page.loading_more || page.query.is_empty() || page.show_hot_list {
+                            return;
+                        }
+                        if page.grid.cards.len() >= page.total_results as usize {
+                            return;
+                        }
+                        page.loading_more = true;
+                        command = Some((page.query.clone(), page.page + 1));
                     }
-                    page.loading_more = true;
-                    let next_page = page.page + 1;
-                    command = Some((page.query.clone(), next_page));
+                    _ => {}
                 }
                 if let Some((keyword, next_page)) = command {
                     let req_id = self.next_request_id("search");
@@ -636,6 +692,7 @@ impl App {
                     self.keybindings.clone(),
                     self.theme_id.clone(),
                     self.credentials.is_some(),
+                    self.config.danmaku.clone(),
                 );
                 self.current_page = Page::Settings(Box::new(page));
             }
@@ -712,6 +769,12 @@ impl App {
                 self.config.keybindings = *new_keybindings;
                 let _ = persistence::save_config(&self.config);
             }
+            AppAction::SaveDanmakuConfig(danmaku) => {
+                self.config.danmaku = *danmaku;
+                self.danmaku_config_tx
+                    .send_replace(self.config.danmaku.clone());
+                let _ = persistence::save_config(&self.config);
+            }
             AppAction::SwitchToLive => {
                 self.sidebar.select(NavItem::Live);
                 self.current_page = Page::Live(LivePage::new());
@@ -722,13 +785,30 @@ impl App {
                 let mut detail_page = LiveDetailPage::new(room_id);
                 let client = &self.api_client;
                 detail_page.load_room_info(client).await;
-                // Connect WebSocket for real-time messages
+                detail_page.load_history_danmaku(client).await;
                 let uid = self
                     .credentials
                     .as_ref()
                     .and_then(|c| c.dede_user_id.parse::<i64>().ok())
                     .unwrap_or(0);
-                detail_page.connect_ws(client, uid).await;
+                let existing_hub = self
+                    .live_danmaku_hub
+                    .as_ref()
+                    .filter(|hub| hub.room_id() == room_id)
+                    .cloned();
+                let hub_result = match existing_hub {
+                    Some(hub) => Ok(hub),
+                    None => crate::api::LiveDanmakuHub::connect(client, room_id, uid).await,
+                };
+                match hub_result {
+                    Ok(hub) => {
+                        detail_page.attach_danmaku_hub(Arc::clone(&hub));
+                        self.live_danmaku_hub = Some(hub);
+                    }
+                    Err(error) => {
+                        detail_page.set_ws_error(format!("WS连接失败: {error}"));
+                    }
+                }
                 self.current_page = Page::LiveDetail(Box::new(detail_page));
             }
             AppAction::RefreshLive => {
@@ -747,7 +827,41 @@ impl App {
                 }
             }
             AppAction::PlayLive { room_id, title: _ } => {
-                match media::play_live(self.api_client.clone(), room_id).await {
+                let existing_hub = self
+                    .live_danmaku_hub
+                    .as_ref()
+                    .filter(|hub| hub.room_id() == room_id)
+                    .cloned();
+                let danmaku_hub = if existing_hub.is_some() {
+                    existing_hub
+                } else {
+                    let uid = self
+                        .credentials
+                        .as_ref()
+                        .and_then(|credentials| credentials.dede_user_id.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    match crate::api::LiveDanmakuHub::connect(&self.api_client, room_id, uid).await
+                    {
+                        Ok(hub) => {
+                            self.live_danmaku_hub = Some(Arc::clone(&hub));
+                            Some(hub)
+                        }
+                        Err(error) => {
+                            if let Page::LiveDetail(page) = &mut self.current_page {
+                                page.set_ws_error(format!("WS连接失败: {error}"));
+                            }
+                            None
+                        }
+                    }
+                };
+                match media::play_live(
+                    self.api_client.clone(),
+                    room_id,
+                    danmaku_hub,
+                    self.danmaku_config_tx.subscribe(),
+                )
+                .await
+                {
                     Ok(()) => {
                         self.playback.status = crate::domain::playback::PlaybackStatus::Playing;
                         self.playback.last_error = None;
@@ -889,7 +1003,12 @@ impl App {
                         self.init_current_page().await;
                     }
                 } else {
-                    self.current_page = Page::Settings(Box::<SettingsPage>::default());
+                    self.current_page = Page::Settings(Box::new(SettingsPage::new(
+                        self.keybindings.clone(),
+                        self.theme_id.clone(),
+                        false,
+                        self.config.danmaku.clone(),
+                    )));
                 }
             }
             NavItem::Settings => {
@@ -898,6 +1017,7 @@ impl App {
                         self.keybindings.clone(),
                         self.theme_id.clone(),
                         self.credentials.is_some(),
+                        self.config.danmaku.clone(),
                     );
                     self.current_page = Page::Settings(Box::new(page));
                 }
@@ -928,11 +1048,20 @@ impl App {
                 page.load_qrcode(&client).await;
             }
             Page::Home(page) => {
-                page.begin_loading();
-                let req_id = self.next_request_id("home");
+                let feed = {
+                    page.begin_loading();
+                    page.search_mut().start_hotword_loading();
+                    page.feed()
+                };
+                let home_req_id = self.next_request_id("home");
                 self.send_network_command(network::NetworkCommand::LoadHome {
-                    req_id,
+                    req_id: home_req_id,
+                    feed,
                     use_guest_feed: self.credentials.is_none(),
+                });
+                let hotword_req_id = self.next_request_id("hotwords");
+                self.send_network_command(network::NetworkCommand::LoadHotwords {
+                    req_id: hotword_req_id,
                 });
             }
             Page::Favorites(page) => {

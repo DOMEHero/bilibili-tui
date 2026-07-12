@@ -281,6 +281,27 @@ impl HistoryPage {
         }
     }
 
+    fn move_page(&mut self, down: bool) -> bool {
+        let Some(last_index) = self.items.len().checked_sub(1) else {
+            return false;
+        };
+        let page_size = self
+            .cached_visible_rows
+            .max(1)
+            .saturating_mul(Self::COLUMNS);
+        let old_index = self.selected;
+        self.selected = if down {
+            old_index.saturating_add(page_size).min(last_index)
+        } else {
+            old_index.saturating_sub(page_size)
+        };
+        if old_index == self.selected {
+            return false;
+        }
+        self.update_scroll(self.cached_visible_rows.max(1));
+        true
+    }
+
     fn action_for_history_item(item: &HistoryItem) -> Option<AppAction> {
         if item.is_video() {
             if let Some(bvid) = item.get_bvid() {
@@ -374,6 +395,17 @@ impl Component for HistoryPage {
             if self.selected + 1 < total {
                 self.selected += 1;
             }
+            return None;
+        }
+        if keys.matches_page_down(key) {
+            self.move_page(true);
+            if self.is_near_bottom(self.cached_visible_rows) {
+                return Some(AppAction::LoadMoreHistory);
+            }
+            return None;
+        }
+        if keys.matches_page_up(key) {
+            self.move_page(false);
             return None;
         }
         if keys.matches_up(key) {

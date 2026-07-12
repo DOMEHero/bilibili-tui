@@ -3,14 +3,16 @@
 use super::{Component, Theme};
 use crate::api::client::ApiClient;
 use crate::api::live::LiveRoomInfo;
-use crate::api::live_client::LiveClient;
+use crate::api::live_danmaku_hub::LiveDanmakuHub;
 use crate::api::live_ws::LiveMessage;
 use crate::application::AppAction;
 use crate::storage::Keybindings;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::{prelude::*, widgets::*};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::broadcast;
 
 /// Maximum number of messages to keep in buffers
 const MAX_MESSAGES: usize = 100;
@@ -39,8 +41,9 @@ pub struct LiveDetailPage {
     loading: bool,
     error: Option<String>,
 
-    // WebSocket client
-    live_client: Option<LiveClient>,
+    // Shared WebSocket hub and this page's independent subscription.
+    live_hub: Option<Arc<LiveDanmakuHub>>,
+    live_rx: Option<broadcast::Receiver<LiveMessage>>,
     ws_connected: bool,
     ws_error: Option<String>,
 
@@ -58,7 +61,8 @@ impl LiveDetailPage {
             room_info: None,
             loading: false,
             error: None,
-            live_client: None,
+            live_hub: None,
+            live_rx: None,
             ws_connected: false,
             ws_error: None,
             danmakus: VecDeque::with_capacity(MAX_MESSAGES),
@@ -119,57 +123,45 @@ impl LiveDetailPage {
         }
     }
 
-    /// Connect to WebSocket for live messages
-    pub async fn connect_ws(&mut self, api_client: &ApiClient, uid: i64) {
-        // Load history danmaku first
-        if !self.history_loaded {
-            self.load_history_danmaku(api_client).await;
-        }
+    pub fn attach_danmaku_hub(&mut self, hub: Arc<LiveDanmakuHub>) {
+        self.live_rx = Some(hub.subscribe());
+        self.live_hub = Some(hub);
+        self.ws_connected = false;
+        self.ws_error = None;
+    }
 
-        // Get danmu info (token + hosts)
-        match api_client.get_danmu_info(self.room_id).await {
-            Ok(danmu_info) => {
-                // Connect to WebSocket
-                match LiveClient::connect(self.room_id, uid, &danmu_info).await {
-                    Ok(client) => {
-                        self.live_client = Some(client);
-                        self.ws_connected = false;
-                        self.ws_error = None;
-                    }
-                    Err(e) => {
-                        self.ws_error = Some(format!("WS连接失败: {}", e));
-                    }
-                }
-            }
-            Err(e) => {
-                // Show detailed error in UI
-                self.ws_error = Some(format!("{}", e));
-            }
-        }
+    pub fn set_ws_error(&mut self, error: impl Into<String>) {
+        self.ws_connected = false;
+        self.ws_error = Some(error.into());
     }
 
     /// Poll for new messages from WebSocket
     pub fn poll_messages(&mut self) {
-        if let Some(client) = self.live_client.as_mut() {
-            if let Some(error) = client.take_error() {
+        if let Some(hub) = self.live_hub.as_ref() {
+            if let Some(error) = hub.take_error() {
                 self.ws_connected = false;
                 self.ws_error = Some(format!("WebSocket连接异常: {error}"));
             }
-            if client.is_connected() {
+            if hub.is_connected() {
                 self.ws_connected = true;
                 self.ws_error = None;
             }
         }
-        // Collect messages first to avoid borrow issues
-        let messages: Vec<LiveMessage> = if let Some(ref mut client) = self.live_client {
-            let mut msgs = Vec::new();
-            while let Some(msg) = client.try_recv() {
-                msgs.push(msg);
+        let mut messages = Vec::new();
+        if let Some(receiver) = self.live_rx.as_mut() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(message) => messages.push(message),
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        self.ws_connected = false;
+                        self.ws_error = Some("直播弹幕通道已关闭".to_string());
+                        break;
+                    }
+                }
             }
-            msgs
-        } else {
-            Vec::new()
-        };
+        }
 
         // Process collected messages
         for msg in messages {

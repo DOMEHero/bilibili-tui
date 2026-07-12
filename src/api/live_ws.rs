@@ -182,10 +182,12 @@ pub struct AuthBody {
     #[serde(rename = "type")]
     pub auth_type: u8,
     pub key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub buvid: String,
 }
 
 /// Create authentication packet
-pub fn make_auth_packet(room_id: i64, uid: i64, token: &str) -> Vec<u8> {
+pub fn make_auth_packet(room_id: i64, uid: i64, token: &str, buvid: &str) -> Vec<u8> {
     let body = AuthBody {
         uid,
         roomid: room_id,
@@ -193,6 +195,7 @@ pub fn make_auth_packet(room_id: i64, uid: i64, token: &str) -> Vec<u8> {
         platform: "web".to_string(),
         auth_type: 2,
         key: token.to_string(),
+        buvid: buvid.to_string(),
     };
 
     let body_json = serde_json::to_vec(&body).unwrap_or_default();

@@ -5,13 +5,14 @@ mod runtime;
 use crate::application::network;
 use crate::domain::playback::{PlaybackEvent, PlaybackState};
 use crate::infrastructure::{
-    bilibili::ApiClient,
+    bilibili::{ApiClient, LiveDanmakuHub},
     persistence::{self, AppConfig, Credentials, Keybindings},
 };
 use crate::presentation::tui::{BangumiPage, DEFAULT_THEME_ID, HomePage, Page, Sidebar, Theme};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
+use tokio::sync::watch;
 
 #[derive(Default)]
 struct RequestTracker {
@@ -63,6 +64,8 @@ pub struct App {
     pub keybindings: Keybindings,
     pub pending_home_notice: Option<String>,
     pub playback: PlaybackState,
+    pub live_danmaku_hub: Option<Arc<LiveDanmakuHub>>,
+    danmaku_config_tx: watch::Sender<crate::storage::DanmakuConfig>,
     playback_event_tx: mpsc::Sender<PlaybackEvent>,
     playback_event_rx: mpsc::Receiver<PlaybackEvent>,
     auto_return_after_playback: Option<(u64, String)>,
@@ -97,6 +100,7 @@ impl App {
 
         // Load config and apply saved theme
         let config = persistence::load_config().unwrap_or_default();
+        let (danmaku_config_tx, _) = watch::channel(config.danmaku.clone());
         let keybindings = config.keybindings.clone();
         let configured_theme_id = config.theme.clone();
         let (theme, used_fallback) = Theme::load_or_default(&configured_theme_id);
@@ -125,6 +129,8 @@ impl App {
             pending_home_notice: used_fallback
                 .then_some("⚠ 旧主题配置无效，请前往设置页重新选择主题".to_string()),
             playback: PlaybackState::default(),
+            live_danmaku_hub: None,
+            danmaku_config_tx,
             playback_event_tx,
             playback_event_rx,
             auto_return_after_playback: None,

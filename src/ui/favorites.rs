@@ -7,11 +7,12 @@ use crate::application::AppAction;
 use crate::storage::Keybindings;
 use ratatui::{
     Frame,
-    crossterm::event::KeyCode,
-    layout::{Constraint, Direction, Layout, Rect},
+    crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
+use std::time::Instant;
 
 pub struct FavoritesPage {
     pub mid: i64,
@@ -26,6 +27,8 @@ pub struct FavoritesPage {
     pub loading: bool,
     pub loading_more: bool,
     pub error: Option<String>,
+    last_click_time: Option<Instant>,
+    last_click_index: Option<usize>,
 }
 
 impl FavoritesPage {
@@ -37,12 +40,14 @@ impl FavoritesPage {
             selected_source: 0,
             focus_sources: true,
             active_source: FavoriteSource::WatchLater,
-            videos: VideoCardGrid::new(),
+            videos: VideoCardGrid::new_list(),
             page: 1,
             total: 0,
             loading: true,
             loading_more: false,
             error: None,
+            last_click_time: None,
+            last_click_index: None,
         }
     }
 
@@ -313,8 +318,11 @@ impl Component for FavoritesPage {
         }
         frame.render_widget(
             Paragraph::new(format!(
-                "[↑/↓] 选择  [←/→] 收藏/视频  [Enter] 打开  [{}] 下一页面  [{}] 上一页面",
-                keys.nav_next_page, keys.nav_prev_page
+                "[↑/↓] 选择  [{}/{}] 翻页  [←/→] 收藏/视频  [Enter] 打开  [{}] 下一页面  [{}] 上一页面",
+                keys.page_up,
+                keys.page_down,
+                keys.nav_next_page,
+                keys.nav_prev_page
             )),
             right[2],
         );
@@ -332,13 +340,32 @@ impl Component for FavoritesPage {
             return Some(AppAction::NavPrev);
         }
         let sources = self.sources();
+        // Pane switching has priority over loading and list navigation.
+        if keys.matches_left(key) {
+            self.focus_sources = true;
+            if self.loading || self.loading_more {
+                self.loading = false;
+                self.loading_more = false;
+                return Some(AppAction::CancelPendingLoads);
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_right(key) {
+            if self.focus_sources
+                && let Some(source) = sources.get(self.selected_source)
+                && *source != self.active_source
+            {
+                self.focus_sources = false;
+                return Some(AppAction::SelectFavoriteSource(source.clone()));
+            }
+            self.focus_sources = false;
+            return Some(AppAction::None);
+        }
         if self.focus_sources {
             if keys.matches_down(key) && self.selected_source + 1 < sources.len() {
                 self.selected_source += 1;
             } else if keys.matches_up(key) && self.selected_source > 0 {
                 self.selected_source -= 1;
-            } else if keys.matches_right(key) {
-                self.focus_sources = false;
             } else if keys.matches_confirm(key)
                 && let Some(source) = sources.get(self.selected_source)
                 && *source != self.active_source
@@ -348,9 +375,23 @@ impl Component for FavoritesPage {
             return Some(AppAction::None);
         }
 
-        if keys.matches_left(key) {
-            self.focus_sources = true;
-        } else if keys.matches_down(key) {
+        if keys.matches_page_down(key) {
+            self.videos.move_page_down();
+            if self.videos.is_near_bottom(self.videos.cached_visible_rows)
+                && !self.loading_more
+                && self.videos.cards.len() < self.total as usize
+            {
+                self.loading_more = true;
+                return Some(AppAction::LoadMoreFavorites);
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_up(key) {
+            self.videos.move_page_up();
+            return Some(AppAction::None);
+        }
+
+        if keys.matches_down(key) {
             self.videos.move_down();
             if self.videos.is_near_bottom(self.videos.cached_visible_rows)
                 && !self.loading_more
@@ -361,13 +402,93 @@ impl Component for FavoritesPage {
             }
         } else if keys.matches_up(key) {
             self.videos.move_up();
-        } else if keys.matches_right(key) {
-            self.videos.move_right();
         } else if keys.matches_confirm(key)
             && let Some(card) = self.videos.selected_card()
             && let (Some(bvid), Some(aid)) = (&card.bvid, card.aid)
         {
             return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
+        }
+        Some(AppAction::None)
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
+        let position = Position::new(event.column, event.row);
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .split(area);
+        let video_parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(2),
+            ])
+            .split(panes[1]);
+        match event.kind {
+            MouseEventKind::ScrollDown if panes[1].contains(position) => {
+                self.focus_sources = false;
+                if self.videos.move_down()
+                    && self.videos.is_near_bottom(self.videos.cached_visible_rows)
+                    && !self.loading_more
+                    && self.videos.cards.len() < self.total as usize
+                {
+                    self.loading_more = true;
+                    return Some(AppAction::LoadMoreFavorites);
+                }
+            }
+            MouseEventKind::ScrollUp if panes[1].contains(position) => {
+                self.focus_sources = false;
+                self.videos.move_up();
+            }
+            MouseEventKind::Down(MouseButton::Left) if panes[0].contains(position) => {
+                self.focus_sources = true;
+                let item_row = event.row.saturating_sub(panes[0].y + 1) as usize;
+                let source_index = if item_row == 1 {
+                    Some(0)
+                } else if (3..3 + self.created.len()).contains(&item_row) {
+                    Some(item_row - 2)
+                } else {
+                    let first_collected = 4 + self.created.len();
+                    (item_row >= first_collected)
+                        .then_some(1 + self.created.len() + item_row - first_collected)
+                };
+                if let Some(index) = source_index.filter(|index| *index < self.sources().len()) {
+                    self.selected_source = index;
+                    if let Some(source) = self.sources().get(index)
+                        && *source != self.active_source
+                    {
+                        return Some(AppAction::SelectFavoriteSource(source.clone()));
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if video_parts[1].contains(position) => {
+                self.focus_sources = false;
+                if self.videos.select_at(event.row, video_parts[1]) {
+                    let index = self.videos.selected_index;
+                    let now = Instant::now();
+                    let double = self.last_click_index == Some(index)
+                        && self
+                            .last_click_time
+                            .is_some_and(|time| now.duration_since(time).as_millis() < 500);
+                    self.last_click_index = Some(index);
+                    self.last_click_time = Some(now);
+                    if double
+                        && let Some(card) = self.videos.selected_card()
+                        && let (Some(bvid), Some(aid)) = (&card.bvid, card.aid)
+                    {
+                        return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Middle) if video_parts[1].contains(position) => {
+                if let Some(card) = self.videos.selected_card()
+                    && let (Some(bvid), Some(aid)) = (&card.bvid, card.aid)
+                {
+                    return Some(AppAction::OpenVideoDetail(bvid.clone(), aid));
+                }
+            }
+            _ => {}
         }
         Some(AppAction::None)
     }
@@ -423,5 +544,26 @@ mod tests {
         assert!(matches!(sources[0], FavoriteSource::WatchLater));
         assert!(matches!(sources[1], FavoriteSource::Created { .. }));
         assert!(matches!(sources[2], FavoriteSource::Collected { .. }));
+    }
+
+    #[test]
+    fn favorites_video_list_is_single_column() {
+        let page = FavoritesPage::new(1);
+        assert_eq!(page.videos.columns, 1);
+        assert!(page.videos.list_layout);
+    }
+
+    #[test]
+    fn left_cancels_loading_before_video_navigation() {
+        let mut page = FavoritesPage::new(1);
+        page.focus_sources = false;
+        page.loading = true;
+        let keys = Keybindings::default();
+        assert!(matches!(
+            page.handle_input(KeyCode::Left, &keys),
+            Some(AppAction::CancelPendingLoads)
+        ));
+        assert!(page.focus_sources);
+        assert!(!page.loading);
     }
 }

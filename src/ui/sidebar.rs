@@ -33,7 +33,6 @@ impl NavItem {
     pub fn all() -> &'static [NavItem] {
         &[
             NavItem::Home,
-            NavItem::Search,
             NavItem::Dynamic,
             NavItem::History,
             NavItem::Favorites,

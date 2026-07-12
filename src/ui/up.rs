@@ -292,8 +292,11 @@ impl Component for UpPage {
 
         frame.render_widget(
             Paragraph::new(format!(
-                "[1/2] 投稿/收藏夹  [o] 最新/热门  [s] 顺序/倒序/随机  [{}] 连播  [Enter] 打开  [{}] 返回",
-                keys.play, keys.back
+                "[1/2] 投稿/收藏夹  [{}/{}] 翻页  [o] 最新/热门  [s] 顺序/倒序/随机  [{}] 连播  [Enter] 打开  [{}] 返回",
+                keys.page_up,
+                keys.page_down,
+                keys.play,
+                keys.back
             )),
             chunks[3],
         );
@@ -394,6 +397,22 @@ impl Component for UpPage {
                     play_order: self.play_order,
                 });
             }
+        }
+        if keys.matches_page_down(key) {
+            grid.move_page_down();
+            if grid.is_near_bottom(grid.cached_visible_rows) && !loading_more {
+                if tab == UpTab::Videos && grid.cards.len() < video_total as usize {
+                    return Some(AppAction::LoadMoreUpVideos);
+                }
+                if tab == UpTab::Favorites && favorite_has_more {
+                    return Some(AppAction::LoadMoreFavoriteResources);
+                }
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_up(key) {
+            grid.move_page_up();
+            return Some(AppAction::None);
         }
         if keys.matches_down(key) {
             grid.move_down();
