@@ -2,6 +2,7 @@ mod bangumi;
 mod bangumi_detail;
 mod dynamic;
 mod dynamic_detail;
+mod favorites;
 mod history;
 mod home;
 mod live;
@@ -11,6 +12,7 @@ mod search;
 mod settings;
 mod sidebar;
 pub mod theme;
+mod up;
 mod video_card;
 mod video_detail;
 
@@ -18,6 +20,7 @@ pub use bangumi::BangumiPage;
 pub use bangumi_detail::BangumiDetailPage;
 pub use dynamic::{DynamicPage, DynamicTab};
 pub use dynamic_detail::DynamicDetailPage;
+pub use favorites::FavoritesPage;
 pub use history::HistoryPage;
 pub use home::HomePage;
 pub use live::LivePage;
@@ -27,6 +30,7 @@ pub use search::SearchPage;
 pub use settings::SettingsPage;
 pub use sidebar::{NavItem, Sidebar};
 pub use theme::{DEFAULT_THEME_ID, Theme, ThemeChoice};
+pub use up::UpPage;
 pub use video_card::{VideoCard, VideoCardGrid};
 pub use video_detail::VideoDetailPage;
 
@@ -68,7 +72,9 @@ pub enum Page {
     Dynamic(DynamicPage),
     DynamicDetail(Box<DynamicDetailPage>),
     VideoDetail(Box<VideoDetailPage>),
+    Up(Box<UpPage>),
     History(HistoryPage),
+    Favorites(FavoritesPage),
     Live(LivePage),
     LiveDetail(Box<LiveDetailPage>),
     Settings(Box<SettingsPage>),

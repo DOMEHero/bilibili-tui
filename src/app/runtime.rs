@@ -5,6 +5,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent},
     prelude::*,
+    widgets::{Block, Borders, Paragraph},
 };
 use std::io;
 
@@ -68,7 +69,11 @@ impl App {
         // Login page, VideoDetail, DynamicDetail, and BangumiDetail use full area
         if matches!(
             self.current_page,
-            Page::Login(_) | Page::VideoDetail(_) | Page::DynamicDetail(_) | Page::BangumiDetail(_)
+            Page::Login(_)
+                | Page::VideoDetail(_)
+                | Page::DynamicDetail(_)
+                | Page::BangumiDetail(_)
+                | Page::Up(_)
         ) {
             return area;
         }
@@ -93,15 +98,21 @@ impl App {
         // Login page, VideoDetail, DynamicDetail, and BangumiDetail don't show sidebar
         if matches!(
             self.current_page,
-            Page::Login(_) | Page::VideoDetail(_) | Page::DynamicDetail(_) | Page::BangumiDetail(_)
+            Page::Login(_)
+                | Page::VideoDetail(_)
+                | Page::DynamicDetail(_)
+                | Page::BangumiDetail(_)
+                | Page::Up(_)
         ) {
             match &mut self.current_page {
                 Page::Login(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::VideoDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::DynamicDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::BangumiDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
+                Page::Up(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 _ => {}
             }
+            self.draw_playback_error(frame, area);
             return;
         }
 
@@ -127,6 +138,23 @@ impl App {
         } else {
             self.draw_page(frame, chunks[0]);
         }
+        self.draw_playback_error(frame, area);
+    }
+
+    fn draw_playback_error(&self, frame: &mut Frame, area: Rect) {
+        let Some(error) = self.playback.last_error.as_deref() else {
+            return;
+        };
+        let popup = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(3),
+            width: area.width,
+            height: 3.min(area.height),
+        };
+        let message = Paragraph::new(error)
+            .style(Style::default().fg(Color::Red))
+            .block(Block::default().borders(Borders::ALL).title(" 播放错误 "));
+        frame.render_widget(message, popup);
     }
 
     fn draw_page(&mut self, frame: &mut Frame, area: Rect) {
@@ -143,15 +171,20 @@ impl App {
             Page::DynamicDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::VideoDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::History(page) => page.draw(frame, area, &self.theme, &self.keybindings),
+            Page::Favorites(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::Live(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::LiveDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::Settings(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::Bangumi(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::BangumiDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
+            Page::Up(page) => page.draw(frame, area, &self.theme, &self.keybindings),
         }
     }
 
     async fn handle_input(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        // Playback errors remain visible until the user acknowledges them with
+        // the next key press; the key still performs its normal action.
+        self.playback.last_error = None;
         let keys = &self.keybindings;
         let action = match &mut self.current_page {
             Page::Login(page) => page.handle_input(key, keys),
@@ -161,11 +194,13 @@ impl App {
             Page::DynamicDetail(page) => page.handle_input(key, keys),
             Page::VideoDetail(page) => page.handle_input(key, keys),
             Page::History(page) => page.handle_input(key, keys),
+            Page::Favorites(page) => page.handle_input(key, keys),
             Page::Live(page) => page.handle_input(key, keys),
             Page::LiveDetail(page) => page.handle_input(key, keys),
             Page::Settings(page) => page.handle_input(key, keys),
             Page::Bangumi(page) => page.handle_input(key, keys),
             Page::BangumiDetail(page) => page.handle_input(key, keys),
+            Page::Up(page) => page.handle_input(key, keys),
         };
 
         if let Some(action) = action {
@@ -182,11 +217,13 @@ impl App {
             Page::DynamicDetail(page) => page.handle_mouse(event, area),
             Page::VideoDetail(page) => page.handle_mouse(event, area),
             Page::History(page) => page.handle_mouse(event, area),
+            Page::Favorites(page) => page.handle_mouse(event, area),
             Page::Live(page) => page.handle_mouse(event, area),
             Page::LiveDetail(page) => page.handle_mouse(event, area),
             Page::Settings(page) => page.handle_mouse(event, area),
             Page::Bangumi(page) => page.handle_mouse(event, area),
             Page::BangumiDetail(page) => page.handle_mouse(event, area),
+            Page::Up(page) => page.handle_mouse(event, area),
         };
 
         if let Some(action) = action {
@@ -194,8 +231,34 @@ impl App {
         }
     }
 
-    async fn tick(&mut self) {
+    pub(super) async fn tick(&mut self) {
         self.drain_network_events();
+        while let Ok(event) = self.playback_event_rx.try_recv() {
+            let crate::domain::playback::PlaybackEvent::Finished { bvid } = event;
+            self.playback.status = crate::domain::playback::PlaybackStatus::Finished;
+            if self.auto_return_after_playback.as_deref() == Some(&bvid)
+                && matches!(&self.current_page, Page::VideoDetail(page) if page.bvid == bvid)
+            {
+                self.auto_return_after_playback = None;
+                self.handle_action(crate::application::AppAction::BackToList)
+                    .await;
+            }
+        }
+
+        let auto_play = if let Page::VideoDetail(page) = &mut self.current_page {
+            if page.auto_play_pending && !page.loading && page.video_info.is_some() {
+                page.auto_play_pending = false;
+                Some((page.bvid.clone(), page.play_action()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((bvid, action)) = auto_play {
+            self.auto_return_after_playback = Some(bvid);
+            self.handle_action(action).await;
+        }
         match &mut self.current_page {
             Page::Login(page) => {
                 let client = &self.api_client;
@@ -224,9 +287,19 @@ impl App {
                 page.poll_cover_results();
                 page.start_cover_downloads();
             }
+            Page::Favorites(page) => {
+                page.videos.poll_cover_results();
+                page.videos.start_cover_downloads();
+            }
             Page::Bangumi(page) => {
                 page.index_grid.poll_cover_results();
                 page.index_grid.start_cover_downloads();
+            }
+            Page::Up(page) => {
+                page.videos.poll_cover_results();
+                page.videos.start_cover_downloads();
+                page.favorite_videos.poll_cover_results();
+                page.favorite_videos.start_cover_downloads();
             }
             _ => {}
         }

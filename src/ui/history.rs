@@ -392,6 +392,11 @@ impl Component for HistoryPage {
             }
             return None;
         }
+        if key == KeyCode::Char('u')
+            && let Some(item) = self.items.get(self.selected)
+        {
+            return Some(AppAction::OpenUpPage(item.item.author_mid));
+        }
         if keys.matches_confirm(key) {
             if let Some(card) = self.items.get(self.selected) {
                 return Self::action_for_history_item(&card.item);

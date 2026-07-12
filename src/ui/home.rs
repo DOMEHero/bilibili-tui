@@ -468,6 +468,15 @@ impl Component for HomePage {
             }
             return Some(AppAction::None);
         }
+        if key == KeyCode::Char('u')
+            && let Some(mid) = self
+                .videos
+                .get(self.selected_index)
+                .and_then(|card| card.video.owner.as_ref())
+                .map(|owner| owner.mid)
+        {
+            return Some(AppAction::OpenUpPage(mid));
+        }
         if keys.matches_confirm(key) || keys.matches_play(key) {
             if let Some(card) = self.videos.get(self.selected_index)
                 && let Some(bvid) = &card.video.bvid

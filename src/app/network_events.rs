@@ -157,11 +157,141 @@ impl App {
                             video.format_views(),
                             video.format_duration(),
                             video.cover_url(),
-                        );
+                        )
+                        .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
                         page.related_card_grid.add_card(card);
                     }
                     page.loading = false;
                     page.error_message = None;
+                }
+            }
+            network::NetworkEvent::UpPageLoaded {
+                req_id,
+                mid,
+                order,
+                profile,
+                relation,
+                videos,
+                folders,
+            } => {
+                if !self.is_latest_request("up_page", req_id) {
+                    return;
+                }
+                if let Page::Up(page) = &mut self.current_page
+                    && page.mid == mid
+                    && page.video_order == order
+                {
+                    page.apply_initial(profile, relation, videos, folders);
+                }
+            }
+            network::NetworkEvent::UpVideosLoaded {
+                req_id,
+                mid,
+                page: loaded_page,
+                order,
+                videos,
+            } => {
+                if !self.is_latest_request("up_videos", req_id) {
+                    return;
+                }
+                if let Page::Up(page) = &mut self.current_page
+                    && page.mid == mid
+                    && page.video_order == order
+                {
+                    if loaded_page == 1 {
+                        page.videos.clear();
+                    }
+                    page.apply_more_videos(loaded_page, videos);
+                    page.loading = false;
+                }
+            }
+            network::NetworkEvent::FavoriteResourcesLoaded {
+                req_id,
+                owner_mid,
+                media_id,
+                page: loaded_page,
+                order,
+                resources,
+            } => {
+                if !self.is_latest_request("favorite_resources", req_id) {
+                    return;
+                }
+                if let Page::Up(page) = &mut self.current_page
+                    && page.mid == owner_mid
+                    && page.favorite_order == order
+                {
+                    page.apply_favorite_resources(media_id, loaded_page, resources);
+                }
+            }
+            network::NetworkEvent::FavoritesInitLoaded {
+                req_id,
+                mid,
+                watch_later,
+                created,
+                collected,
+            } => {
+                if !self.is_latest_request("favorites_init", req_id) {
+                    return;
+                }
+                if let Page::Favorites(page) = &mut self.current_page
+                    && page.mid == mid
+                {
+                    page.apply_initial(watch_later, created, collected);
+                }
+            }
+            network::NetworkEvent::FavoritesWatchLaterLoaded { req_id, page, data } => {
+                if !self.is_latest_request("favorites_content", req_id) {
+                    return;
+                }
+                if let Page::Favorites(favorites) = &mut self.current_page
+                    && matches!(
+                        favorites.active_source,
+                        crate::api::favorite::FavoriteSource::WatchLater
+                    )
+                {
+                    favorites.apply_watch_later(page, data);
+                }
+            }
+            network::NetworkEvent::FavoritesCreatedLoaded {
+                req_id,
+                media_id,
+                page,
+                data,
+            } => {
+                if !self.is_latest_request("favorites_content", req_id) {
+                    return;
+                }
+                if let Page::Favorites(favorites) = &mut self.current_page
+                    && matches!(
+                        favorites.active_source,
+                        crate::api::favorite::FavoriteSource::Created {
+                            media_id: active_id,
+                            ..
+                        } if active_id == media_id
+                    )
+                {
+                    favorites.apply_created(page, data);
+                }
+            }
+            network::NetworkEvent::FavoritesCollectedLoaded {
+                req_id,
+                season_id,
+                page,
+                data,
+            } => {
+                if !self.is_latest_request("favorites_content", req_id) {
+                    return;
+                }
+                if let Page::Favorites(favorites) = &mut self.current_page
+                    && matches!(
+                        favorites.active_source,
+                        crate::api::favorite::FavoriteSource::Collected {
+                            season_id: active_id,
+                            ..
+                        } if active_id == season_id
+                    )
+                {
+                    favorites.apply_collected(page, data);
                 }
             }
             network::NetworkEvent::DynamicDetailLoaded {
@@ -250,6 +380,16 @@ impl App {
                     (Page::VideoDetail(page), "video_detail") => {
                         page.error_message = Some(format!("加载视频信息失败: {}", error));
                         page.loading = false;
+                    }
+                    (Page::Up(page), "up_page") | (Page::Up(page), "up_videos") => {
+                        page.set_error(format!("加载UP主空间失败: {error}"));
+                    }
+                    (Page::Up(page), "favorite_resources") => {
+                        page.set_error(format!("加载收藏夹失败: {error}"));
+                    }
+                    (Page::Favorites(page), "favorites_init")
+                    | (Page::Favorites(page), "favorites_content") => {
+                        page.set_error(format!("加载收藏失败: {error}"));
                     }
                     (Page::DynamicDetail(page), "dynamic_detail") => {
                         page.error_message = Some(format!("加载动态详情失败: {}", error));

@@ -19,6 +19,8 @@ pub struct CoverResult {
 pub struct VideoCard {
     pub bvid: Option<String>,
     pub aid: Option<i64>,
+    /// Bilibili member ID of the uploader. This is not the video's aid.
+    pub uploader_mid: Option<i64>,
     pub title: String,
     pub author: String,
     pub views: String,
@@ -40,6 +42,7 @@ impl VideoCard {
         Self {
             bvid,
             aid,
+            uploader_mid: None,
             title,
             author,
             views,
@@ -47,6 +50,11 @@ impl VideoCard {
             pic_url,
             cover: None,
         }
+    }
+
+    pub fn with_uploader_mid(mut self, uploader_mid: Option<i64>) -> Self {
+        self.uploader_mid = uploader_mid;
+        self
     }
 
     /// Render a single video card

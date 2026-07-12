@@ -2,8 +2,26 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static COOKIE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn write_private_file(path: &std::path::Path, content: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
 
 /// User credentials from Bilibili login
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,7 +438,7 @@ fn get_config_path() -> Result<PathBuf> {
 pub fn save_credentials(credentials: &Credentials) -> Result<()> {
     let path = get_credentials_path()?;
     let json = serde_json::to_string_pretty(credentials)?;
-    fs::write(path, json)?;
+    write_private_file(&path, json.as_bytes())?;
     Ok(())
 }
 
@@ -471,7 +489,8 @@ pub fn load_config() -> Result<AppConfig> {
 
 /// Export cookies in Netscape format for yt-dlp
 pub fn export_cookies_for_ytdlp(credentials: &Credentials) -> Result<PathBuf> {
-    let path = get_config_dir()?.join("cookies.txt");
+    let sequence = COOKIE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let path = get_config_dir()?.join(format!("cookies-{}-{sequence}.txt", std::process::id()));
 
     let content = format!(
         "# Netscape HTTP Cookie File\n\
@@ -481,6 +500,6 @@ pub fn export_cookies_for_ytdlp(credentials: &Credentials) -> Result<PathBuf> {
         credentials.sessdata, credentials.bili_jct, credentials.dede_user_id
     );
 
-    fs::write(&path, content)?;
+    write_private_file(&path, content.as_bytes())?;
     Ok(path)
 }

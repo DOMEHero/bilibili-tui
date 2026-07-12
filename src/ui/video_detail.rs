@@ -49,6 +49,7 @@ pub struct VideoDetailPage {
     pub current_page_index: usize,
     /// Scroll position in episode list
     pub episode_scroll: usize,
+    pub auto_play_pending: bool,
 }
 
 impl VideoDetailPage {
@@ -82,6 +83,38 @@ impl VideoDetailPage {
             last_click_index: None,
             current_page_index: 0,
             episode_scroll: 0,
+            auto_play_pending: true,
+        }
+    }
+
+    pub fn play_action(&self) -> AppAction {
+        if let Some(pages) = self.get_pages() {
+            if pages.len() > 1 {
+                return AppAction::PlayVideoWithPages {
+                    bvid: self.bvid.clone(),
+                    aid: self.aid,
+                    pages: pages.clone(),
+                    current_index: self.current_page_index,
+                };
+            }
+            if let Some(page) = pages.first() {
+                return AppAction::PlayVideo {
+                    bvid: self.bvid.clone(),
+                    aid: self.aid,
+                    cid: page.cid,
+                    duration: page.duration,
+                };
+            }
+        }
+        let (cid, duration) = self
+            .video_info
+            .as_ref()
+            .map_or((0, 0), |info| (info.cid, info.duration.unwrap_or(0)));
+        AppAction::PlayVideo {
+            bvid: self.bvid.clone(),
+            aid: self.aid,
+            cid,
+            duration,
         }
     }
 
@@ -130,7 +163,8 @@ impl VideoDetailPage {
                         video.format_views(),
                         video.format_duration(),
                         video.cover_url(),
-                    );
+                    )
+                    .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
                     self.related_card_grid.add_card(card);
                 }
             }
@@ -757,39 +791,13 @@ impl Component for VideoDetailPage {
         if keys.matches_quit(key) || keys.matches_back(key) {
             return Some(AppAction::BackToList);
         }
+        if key == KeyCode::Char('u')
+            && let Some(info) = &self.video_info
+        {
+            return Some(AppAction::OpenUpPage(info.owner.mid));
+        }
         if keys.matches_play(key) {
-            // For multi-part videos, use PlayVideoWithPages for auto-play next
-            if let Some(pages) = self.get_pages() {
-                if pages.len() > 1 {
-                    return Some(AppAction::PlayVideoWithPages {
-                        bvid: self.bvid.clone(),
-                        aid: self.aid,
-                        pages: pages.clone(),
-                        current_index: self.current_page_index,
-                    });
-                }
-                // Single page video - use original PlayVideo
-                if let Some(page) = pages.first() {
-                    return Some(AppAction::PlayVideo {
-                        bvid: self.bvid.clone(),
-                        aid: self.aid,
-                        cid: page.cid,
-                        duration: page.duration,
-                    });
-                }
-            }
-            // Fallback to video info
-            let (cid, duration) = if let Some(info) = &self.video_info {
-                (info.cid, info.duration.unwrap_or(0))
-            } else {
-                (0, 0)
-            };
-            return Some(AppAction::PlayVideo {
-                bvid: self.bvid.clone(),
-                aid: self.aid,
-                cid,
-                duration,
-            });
+            return Some(self.play_action());
         }
         if keys.matches_comment(key) {
             // Enter comment input mode

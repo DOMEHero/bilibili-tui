@@ -156,6 +156,8 @@ src/
   sudo pacman -S mpv
   ```
 
+  > **关键设置：** Bilibili DASH 的视频和音频是独立流。MPV 默认的相对跳转可能回退到视频关键帧，造成跳转后短暂无声。建议在 `~/.config/mpv/mpv.conf` 中加入 `hr-seek=yes`，让音视频从精确的目标时间恢复。
+
 - **yt-dlp**: 视频提取工具（MPV 内置支持）
 
   ```bash

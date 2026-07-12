@@ -139,7 +139,15 @@ impl LivePage {
     }
 
     pub fn apply_live_more(&mut self, rooms: Vec<LiveRoom>) {
+        let existing = self
+            .rooms
+            .iter()
+            .map(|card| card.room.roomid)
+            .collect::<HashSet<_>>();
         for room in rooms {
+            if existing.contains(&room.roomid) {
+                continue;
+            }
             self.rooms.push(LiveCard {
                 room,
                 cover_image: None,
@@ -300,7 +308,7 @@ impl Component for LivePage {
             .split(area);
 
         // Header
-        let header = Paragraph::new("📺 直播推荐")
+        let header = Paragraph::new("📺 关注直播优先 · B站推荐")
             .block(
                 Block::default()
                     .borders(Borders::ALL)

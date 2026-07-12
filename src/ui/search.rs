@@ -57,13 +57,14 @@ impl SearchPage {
         for item in results {
             let card = VideoCard::new(
                 item.bvid.clone(),
-                item.mid,
+                item.aid,
                 item.display_title(),
                 item.author_name().to_string(),
                 item.format_play(),
                 item.duration.clone().unwrap_or_default(),
                 item.cover_url(),
-            );
+            )
+            .with_uploader_mid(item.mid);
             self.grid.add_card(card);
         }
         self.total_results = total;
@@ -77,13 +78,14 @@ impl SearchPage {
         for item in results {
             let card = VideoCard::new(
                 item.bvid.clone(),
-                item.mid,
+                item.aid,
                 item.display_title(),
                 item.author_name().to_string(),
                 item.format_play(),
                 item.duration.clone().unwrap_or_default(),
                 item.cover_url(),
-            );
+            )
+            .with_uploader_mid(item.mid);
             self.grid.add_card(card);
         }
         self.loading_more = false;
@@ -507,6 +509,11 @@ impl Component for SearchPage {
             if keys.matches_left(key) {
                 self.grid.move_left();
                 return Some(AppAction::None);
+            }
+            if key == KeyCode::Char('u')
+                && let Some(mid) = self.grid.selected_card().and_then(|card| card.uploader_mid)
+            {
+                return Some(AppAction::OpenUpPage(mid));
             }
             if keys.matches_confirm(key) {
                 if let Some(card) = self.grid.selected_card()

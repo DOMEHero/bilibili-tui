@@ -643,6 +643,13 @@ impl Component for DynamicPage {
         }
 
         // Open selected card
+        if key == KeyCode::Char('u')
+            && let Some(mid) = self
+                .selected_dynamic_item()
+                .and_then(|item| item.author_mid())
+        {
+            return Some(AppAction::OpenUpPage(mid));
+        }
         if keys.matches_confirm(key) {
             if let Some(card) = self.grid.selected_card() {
                 // Video card - open video detail
