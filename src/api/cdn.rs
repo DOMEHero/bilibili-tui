@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod catalog;
+
 const PROBE_BYTES: u64 = 512 * 1024 - 1;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
@@ -99,6 +101,8 @@ struct CdnHistory {
     attempts: u64,
     corruptions: u64,
     probe_samples: u64,
+    probe_failures: u64,
+    last_probe_ok: bool,
     latency_ms: f64,
     throughput_bps: f64,
     last_probed_at: i64,
@@ -168,6 +172,17 @@ fn record_probe(host: &str, probe: ProbeScore) {
         entry.latency_ms = entry.latency_ms * (1.0 - alpha) + latency_ms * alpha;
         entry.throughput_bps = entry.throughput_bps * (1.0 - alpha) + probe.throughput_bps * alpha;
         entry.probe_samples = entry.probe_samples.saturating_add(1);
+        entry.last_probe_ok = true;
+        entry.last_probed_at = chrono::Utc::now().timestamp();
+        save_history(&values);
+    }
+}
+
+fn record_probe_failure(host: &str) {
+    if let Ok(mut values) = history().lock() {
+        let entry = values.entry(host.to_string()).or_default();
+        entry.probe_failures = entry.probe_failures.saturating_add(1);
+        entry.last_probe_ok = false;
         entry.last_probed_at = chrono::Utc::now().timestamp();
         save_history(&values);
     }
@@ -176,6 +191,9 @@ fn record_probe(host: &str, probe: ProbeScore) {
 fn record_rank(host: &str, kind: StreamKind, score: f64, speed_ratio: f64, bandwidth: i64) {
     if let Ok(mut values) = history().lock() {
         let entry = values.entry(host.to_string()).or_default();
+        if entry.probe_samples > 0 {
+            entry.last_probe_ok = true;
+        }
         match kind {
             StreamKind::Video => {
                 entry.video_score = Some(score);
@@ -267,42 +285,56 @@ async fn probe(client: &reqwest::Client, url: String) -> (String, Option<ProbeSc
     .await;
 
     let score = result.ok().and_then(Result::ok);
-    if let (Some(host), Some(score)) = (host(&url), score)
-        && let Ok(mut cache) = scores().lock()
-    {
-        cache.insert(
-            host.clone(),
-            CachedScore {
-                measured_at: Instant::now(),
-                probe: score,
-            },
-        );
-        drop(cache);
-        record_probe(&host, score);
+    if let Some(host) = host(&url) {
+        if let Some(score) = score {
+            if let Ok(mut cache) = scores().lock() {
+                cache.insert(
+                    host.clone(),
+                    CachedScore {
+                        measured_at: Instant::now(),
+                        probe: score,
+                    },
+                );
+            }
+            record_probe(&host, score);
+        } else {
+            record_probe_failure(&host);
+        }
     }
     (url, score)
 }
 
 async fn rank_urls(stream: &DashStream, kind: StreamKind) -> Result<Vec<CdnCandidate>> {
-    let mut urls = Vec::with_capacity(
-        1 + stream.backup_url.as_ref().map_or(0, Vec::len)
-            + stream.backup_url_camel.as_ref().map_or(0, Vec::len),
-    );
-    urls.push(
-        stream
-            .primary_url()
-            .ok_or_else(|| anyhow!("CDN 流缺少主地址"))?
-            .to_string(),
-    );
-    urls.extend(stream.backup_urls().cloned());
-    urls.sort_by_key(|url| host(url));
-    urls.dedup_by(|a, b| host(a) == host(b));
-
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(800))
         .build()?;
+    let (region, regional_hosts) = catalog::regional_hosts(&client).await;
+    let mut urls = Vec::with_capacity(
+        regional_hosts.len()
+            + 1
+            + stream.backup_url.as_ref().map_or(0, Vec::len)
+            + stream.backup_url_camel.as_ref().map_or(0, Vec::len),
+    );
+    let primary = stream
+        .primary_url()
+        .ok_or_else(|| anyhow!("CDN 流缺少主地址"))?;
+    // Keep API-provided URLs first: their query can contain CDN-specific
+    // signatures (for example Akamai `hdnts`). Synthetic catalog URLs are
+    // only a fallback for hosts absent from the playurl response.
+    urls.push(primary.to_string());
+    urls.extend(stream.backup_urls().cloned());
+    for candidate_host in regional_hosts {
+        if let Ok(mut url) = reqwest::Url::parse(primary)
+            && url.set_host(Some(&candidate_host)).is_ok()
+        {
+            urls.push(url.to_string());
+        }
+    }
+    urls.sort_by_key(|url| host(url));
+    urls.dedup_by(|a, b| host(a) == host(b));
+
     let results = join_all(urls.into_iter().map(|url| probe(&client, url))).await;
-    let mut ranked = results
+    let all_ranked = results
         .into_iter()
         .filter_map(|(url, probe)| {
             let probe = probe?;
@@ -319,6 +351,19 @@ async fn rank_urls(stream: &DashStream, kind: StreamKind) -> Result<Vec<CdnCandi
             Some(CdnCandidate { url, host, score })
         })
         .collect::<Vec<_>>();
+    let mut preferred = all_ranked
+        .iter()
+        .filter(|candidate| match region {
+            catalog::Region::MainlandChina => !catalog::is_overseas_host(&candidate.host),
+            catalog::Region::Overseas => catalog::is_overseas_host(&candidate.host),
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut ranked = if preferred.is_empty() {
+        all_ranked
+    } else {
+        std::mem::take(&mut preferred)
+    };
     ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
     (!ranked.is_empty())
         .then_some(ranked)
