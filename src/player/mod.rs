@@ -13,7 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+#[cfg(unix)]
+use tokio::net::UnixStream as MpvIpcStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{
+    ClientOptions as MpvIpcClientOptions, NamedPipeClient as MpvIpcStream,
+};
 use tokio::process::Command;
 use tokio::time::{Instant, interval_at, timeout};
 
@@ -57,14 +62,9 @@ pub async fn play_video(
     };
 
     let danmaku = api_client.get_video_danmaku(cid).await.unwrap_or_default();
-    let ipc_path = std::env::temp_dir().join(format!(
-        "bilibili-tui-mpv-{}-{}.sock",
-        std::process::id(),
-        cid
-    ));
-    let _ = std::fs::remove_file(&ipc_path);
-    let _ = std::fs::remove_file(ipc_path.with_extension("danmaku.lua"));
-    let danmaku_script_path = create_live_danmaku_script(&ipc_path)?;
+    let ipc_path = mpv_ipc_path("bilibili-tui-mpv", &cid.to_string());
+    remove_stale_mpv_ipc(&ipc_path);
+    let danmaku_script_path = create_live_danmaku_script()?;
 
     let mut cmd = Command::new("mpv");
 
@@ -333,8 +333,12 @@ fn is_corrupt_video_log(line: &str) -> bool {
     .any(|needle| line.contains(needle))
 }
 
-fn create_live_danmaku_script(ipc_path: &std::path::Path) -> Result<std::path::PathBuf> {
-    let script_path = ipc_path.with_extension("danmaku.lua");
+fn create_live_danmaku_script() -> Result<std::path::PathBuf> {
+    let script_path = std::env::temp_dir().join(format!(
+        "bilibili-tui-danmaku-{}-{}.lua",
+        std::process::id(),
+        MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    ));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -416,9 +420,42 @@ fn mpv_script_name(script_path: &std::path::Path) -> String {
         .collect()
 }
 
+fn mpv_ipc_path(prefix: &str, suffix: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(format!(
+            r"\\.\pipe\{prefix}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::temp_dir().join(format!("{prefix}-{}-{suffix}.sock", std::process::id()))
+    }
+}
+
+fn remove_stale_mpv_ipc(path: &std::path::Path) {
+    #[cfg(not(windows))]
+    let _ = std::fs::remove_file(path);
+
+    #[cfg(windows)]
+    let _ = path;
+}
+
+async fn connect_mpv_ipc(path: &std::path::Path) -> Result<MpvIpcStream> {
+    #[cfg(unix)]
+    {
+        Ok(MpvIpcStream::connect(path).await?)
+    }
+    #[cfg(windows)]
+    {
+        Ok(MpvIpcClientOptions::new().open(path)?)
+    }
+}
+
 async fn mpv_ipc(path: &std::path::Path, command: serde_json::Value) -> Result<serde_json::Value> {
     timeout(Duration::from_secs(2), async {
-        let mut stream = UnixStream::connect(path).await?;
+        let mut stream = connect_mpv_ipc(path).await?;
         let request_id = MPV_IPC_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let mut bytes = serde_json::to_vec(&serde_json::json!({
             "command": command,
@@ -463,7 +500,7 @@ async fn loadfile_and_wait(
         if audio_url.contains(',') {
             anyhow::bail!("audio CDN URL cannot be represented as an MPV option list");
         }
-        let mut stream = UnixStream::connect(path).await?;
+        let mut stream = connect_mpv_ipc(path).await?;
         let request_id = 1u64;
         let load_options = format!("audio-files={audio_url},start={position}");
         let mut bytes = serde_json::to_vec(&serde_json::json!({
@@ -509,7 +546,7 @@ async fn mpv_time_pos(path: &std::path::Path) -> Option<f64> {
 
 async fn load_live_and_wait(path: &std::path::Path, url: &str) -> Result<()> {
     timeout(Duration::from_secs(10), async {
-        let mut stream = UnixStream::connect(path).await?;
+        let mut stream = connect_mpv_ipc(path).await?;
         let request_id = 2u64;
         let mut request = serde_json::to_vec(&serde_json::json!({
             "command": ["loadfile", url, "replace"],
@@ -613,11 +650,8 @@ pub async fn play_playlist(
     cmd.arg("--msg-level=ffmpeg=error,vd=warn");
     cmd.arg("--ytdl=no");
     cmd.arg("--script-opts-append=double_video_fps=yes");
-    let ipc_path = std::env::temp_dir().join(format!(
-        "bilibili-tui-playlist-{}-{session_id}.sock",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&ipc_path);
+    let ipc_path = mpv_ipc_path("bilibili-tui-playlist", &session_id.to_string());
+    remove_stale_mpv_ipc(&ipc_path);
     cmd.arg(format!("--input-ipc-server={}", ipc_path.display()));
 
     let mut child = match cmd.spawn() {
@@ -913,7 +947,7 @@ async fn run_playlist(
 async fn wait_for_ipc(path: &std::path::Path, child: &mut tokio::process::Child) -> Result<()> {
     let mut delay = Duration::from_millis(25);
     loop {
-        if UnixStream::connect(path).await.is_ok() {
+        if connect_mpv_ipc(path).await.is_ok() {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
@@ -980,7 +1014,7 @@ async fn observe_end_files(
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
-    let mut stream = UnixStream::connect(path).await?;
+    let mut stream = connect_mpv_ipc(path).await?;
     let mut request =
         serde_json::to_vec(&serde_json::json!({"command": ["request_log_messages", "no"]}))?;
     request.push(b'\n');
@@ -1093,13 +1127,9 @@ pub async fn play_live(
         .first()
         .ok_or_else(|| anyhow::anyhow!("直播播放地址为空"))?;
     let sequence = LIVE_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let ipc_path = std::env::temp_dir().join(format!(
-        "bilibili-tui-live-{}-{room_id}-{sequence}.sock",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&ipc_path);
-    let _ = std::fs::remove_file(ipc_path.with_extension("danmaku.lua"));
-    let danmaku_script_path = create_live_danmaku_script(&ipc_path)?;
+    let ipc_path = mpv_ipc_path("bilibili-tui-live", &format!("{room_id}-{sequence}"));
+    remove_stale_mpv_ipc(&ipc_path);
+    let danmaku_script_path = create_live_danmaku_script()?;
     let mut child = match spawn_live_mpv(&ipc_path, &danmaku_script_path) {
         Ok(child) => child,
         Err(error) => {
@@ -1501,6 +1531,7 @@ mod playlist_tests {
         assert_eq!(live_retry_delay(100), Duration::from_secs(4));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mpv_ipc_ignores_events_before_its_matching_response() {
         let path = std::env::temp_dir().join(format!(
@@ -1584,6 +1615,7 @@ mod playlist_tests {
         assert!(!args.iter().any(|arg| arg.contains("bilivideo.com")));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn live_cleanup_kills_a_child_when_ipc_is_unavailable() {
         let mut child = Command::new("sh")
