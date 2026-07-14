@@ -620,15 +620,11 @@ impl Component for DynamicPage {
         if panes[0].contains(position) {
             self.focus_up_list = true;
             match event.kind {
-                MouseEventKind::ScrollDown => {
-                    if self.selected_up_index < self.up_list.len() {
-                        return Some(AppAction::SelectUpMaster(self.selected_up_index + 1));
-                    }
+                MouseEventKind::ScrollDown if self.selected_up_index < self.up_list.len() => {
+                    return Some(AppAction::SelectUpMaster(self.selected_up_index + 1));
                 }
-                MouseEventKind::ScrollUp => {
-                    if self.selected_up_index > 0 {
-                        return Some(AppAction::SelectUpMaster(self.selected_up_index - 1));
-                    }
+                MouseEventKind::ScrollUp if self.selected_up_index > 0 => {
+                    return Some(AppAction::SelectUpMaster(self.selected_up_index - 1));
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     let row = event.row.saturating_sub(panes[0].y + 1) as usize;
