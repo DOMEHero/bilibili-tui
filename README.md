@@ -156,6 +156,10 @@ src/
   sudo pacman -S mpv
   ```
 
+  > **关键设置：** Bilibili DASH 的视频和音频是独立流。MPV 默认的相对跳转可能回退到视频关键帧，造成跳转后短暂无声。建议在 `~/.config/mpv/mpv.conf` 中加入 `hr-seek=yes`，让音视频从精确的目标时间恢复。
+
+  > **CDN 隐私：** 应用会对维护目录中的 CDN 裸域名执行无 Cookie、无媒体路径、无签名参数的限时可达性探测，并将结果作为本地排名的少量先验。实际播放只使用 Bilibili `playurl` API 授权返回的地址，不会把签名 URL 改写到目录中的其他主机。
+
 - **yt-dlp**: 视频提取工具（MPV 内置支持）
 
   ```bash
@@ -289,6 +293,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 | 向下移动       | `j` / `↓`           | 在列表中向下移动               |
 | 向左移动       | `h` / `←`           | 向左导航                       |
 | 向右移动       | `l` / `→`           | 向右导航                       |
+| 内容上翻页     | `PageUp`            | 按可见区域向上移动             |
+| 内容下翻页     | `PageDown`          | 按可见区域向下移动             |
 | **操作**       |                     |                                |
 | 确认选择       | `Enter`             | 打开选中项                     |
 | 返回上级       | `Esc`               | 返回上一页面                   |
@@ -367,9 +373,9 @@ cargo build --release --target x86_64-unknown-linux-musl
 #### 视频播放
 
 1. 在视频列表中选择视频
-2. 按 `p` 键或回车键打开视频详情
-3. 在视频详情页面按 `p` 键启动播放
-4. 使用 MPV 播放器播放视频内容
+2. 按回车键进入视频详情；详情加载完成后会自动启动 MPV
+3. 也可以在详情页面按 `p` 键手动启动播放
+4. MPV 正常结束后，自动返回进入详情前的列表页面
 
 #### 图片预览
 
@@ -381,16 +387,18 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ### 配置文件位置
 
-配置文件存储在用户配置目录：
+配置文件存储在系统用户配置目录（Linux 通常为
+`~/.config/bilibili-tui/`，macOS 通常为
+`~/Library/Application Support/bilibili-tui/`）：
 
 ```
 ~/.config/bilibili-tui/
 ├── credentials.json  # 登录凭证
 ├── config.json      # 应用配置
-└── cookies.txt      # 临时 cookies 文件（播放视频时生成）
+└── cookies-<pid>-<序号>.txt  # 播放期间临时生成
 ```
 
-> `cookies.txt` 文件在播放视频时自动生成，用于 MPV/yt-dlp 认证
+> 临时 cookie 文件仅用于 MPV/yt-dlp 认证，权限为 `0600`，播放器退出后会自动删除。不要将配置目录或调试日志提交到版本库。
 
 ### 配置文件格式
 

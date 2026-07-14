@@ -1,6 +1,57 @@
 //! Dynamic feed API types and functions
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_i64()
+            .ok_or_else(|| serde::de::Error::custom("integer is out of range"))
+            .map(Some),
+        Some(serde_json::Value::String(value)) => value
+            .parse::<i64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected integer or numeric string, got {other}"
+        ))),
+    }
+}
+
+fn deserialize_optional_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_i64(deserializer)?
+        .map(|value| i32::try_from(value).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+fn deserialize_optional_f32<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_f64()
+            .map(|value| Some(value as f32))
+            .ok_or_else(|| serde::de::Error::custom("invalid floating-point number")),
+        Some(serde_json::Value::String(value)) => value
+            .parse::<f32>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected number or numeric string, got {other}"
+        ))),
+    }
+}
 
 /// Dynamic feed response
 #[derive(Debug, Deserialize)]
@@ -8,7 +59,93 @@ pub struct DynamicFeedData {
     pub items: Option<Vec<DynamicItem>>,
     pub offset: Option<String>,
     pub has_more: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_i32")]
     pub update_num: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DynamicFeedData;
+    use serde::Deserialize;
+
+    #[test]
+    fn feed_accepts_string_update_num() {
+        let data: DynamicFeedData =
+            serde_json::from_str(r#"{"items":[],"offset":"1","has_more":true,"update_num":"0"}"#)
+                .expect("string update_num should deserialize");
+
+        assert_eq!(data.update_num, Some(0));
+    }
+
+    #[test]
+    fn feed_accepts_numeric_fields_as_numbers_strings_and_null() {
+        let json = r#"{
+          "items": [{
+            "id_str": "1",
+            "type": "DYNAMIC_TYPE_DRAW",
+            "modules": {
+              "module_author": {"pub_ts": "1720000000"},
+              "module_dynamic": {"major": {
+                "type": "MAJOR_TYPE_DRAW",
+                "draw": {"id": "42", "items": [
+                  {"src": "a", "height": "1080", "width": 1920, "size": "1.25"},
+                  {"src": "b", "height": null, "width": null, "size": 2.5}
+                ]}
+              }}
+            }
+          }],
+          "offset": null,
+          "has_more": false,
+          "update_num": 0
+        }"#;
+        let data: DynamicFeedData = serde_json::from_str(json).expect("mixed numeric forms");
+        let item = &data.items.expect("items")[0];
+        let modules = item.modules.as_ref().expect("modules");
+        assert_eq!(
+            modules.module_author.as_ref().and_then(|a| a.pub_ts),
+            Some(1_720_000_000)
+        );
+        let draw = modules
+            .module_dynamic
+            .as_ref()
+            .and_then(|d| d.major.as_ref())
+            .and_then(|m| m.draw.as_ref())
+            .expect("draw");
+        assert_eq!(draw.id, Some(42));
+        let pictures = draw.items.as_ref().expect("pictures");
+        assert_eq!(
+            (pictures[0].height, pictures[0].width, pictures[0].size),
+            (Some(1080), Some(1920), Some(1.25))
+        );
+        assert_eq!(
+            (pictures[1].height, pictures[1].width, pictures[1].size),
+            (None, None, Some(2.5))
+        );
+    }
+
+    #[test]
+    fn feed_rejects_invalid_or_out_of_range_numeric_strings() {
+        let invalid = r#"{"items":[{"modules":{"module_author":{"pub_ts":"not-a-number"}}}]}"#;
+        assert!(serde_json::from_str::<DynamicFeedData>(invalid).is_err());
+        let overflow = r#"{"items":[{"modules":{"module_dynamic":{"major":{"draw":{"items":[{"height":"2147483648"}]}}}}}]}"#;
+        assert!(serde_json::from_str::<DynamicFeedData>(overflow).is_err());
+    }
+
+    #[test]
+    fn saved_real_feed_response_deserializes_when_fixture_is_available() {
+        let Ok(path) = std::env::var("BILIBILI_DYNAMIC_FIXTURE") else {
+            return;
+        };
+        #[derive(Deserialize)]
+        struct Response {
+            data: DynamicFeedData,
+        }
+
+        let body = std::fs::read(path).expect("read dynamic fixture");
+        let response: Response =
+            serde_json::from_slice(&body).expect("deserialize dynamic fixture");
+        assert!(response.data.items.is_some());
+    }
 }
 
 /// Portal data response (frequently watched UPs)
@@ -50,6 +187,7 @@ pub struct ModuleAuthor {
     pub face: Option<String>,
     pub mid: Option<i64>,
     pub pub_time: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub pub_ts: Option<i64>,
 }
 
@@ -91,6 +229,7 @@ pub struct DynamicDesc {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DrawInfo {
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub id: Option<i64>,
     pub items: Option<Vec<DrawItem>>,
 }
@@ -98,8 +237,11 @@ pub struct DrawInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DrawItem {
     pub src: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i32")]
     pub height: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_i32")]
     pub width: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_f32")]
     pub size: Option<f32>,
 }
 
@@ -119,8 +261,11 @@ pub struct OpusSummary {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpusPic {
     pub url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i32")]
     pub height: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_i32")]
     pub width: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_f32")]
     pub size: Option<f32>,
 }
 
@@ -155,6 +300,13 @@ impl DynamicItem {
             .as_ref()
             .and_then(|m| m.module_author.as_ref())
             .and_then(|a| a.face.as_deref())
+    }
+
+    pub fn author_mid(&self) -> Option<i64> {
+        self.modules
+            .as_ref()
+            .and_then(|modules| modules.module_author.as_ref())
+            .and_then(|author| author.mid)
     }
 
     pub fn pub_time(&self) -> &str {

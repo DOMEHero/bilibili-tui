@@ -11,28 +11,38 @@ impl App {
 
     fn handle_network_event(&mut self, event: network::NetworkEvent) {
         match event {
-            network::NetworkEvent::HomeLoaded { req_id, videos } => {
+            network::NetworkEvent::HomeLoaded {
+                req_id,
+                feed,
+                videos,
+            } => {
                 if !self.is_latest_request("home", req_id) {
                     return;
                 }
                 if let Page::Home(page) = &mut self.current_page {
-                    page.apply_recommendations(videos);
+                    page.apply_recommendations(feed, videos);
                 }
             }
-            network::NetworkEvent::HomeMoreLoaded { req_id, videos } => {
+            network::NetworkEvent::HomeMoreLoaded {
+                req_id,
+                feed,
+                videos,
+            } => {
                 if !self.is_latest_request("home_more", req_id) {
                     return;
                 }
                 if let Page::Home(page) = &mut self.current_page {
-                    page.apply_load_more(videos);
+                    page.apply_load_more(feed, videos);
                 }
             }
             network::NetworkEvent::HotwordsLoaded { req_id, hotwords } => {
                 if !self.is_latest_request("hotwords", req_id) {
                     return;
                 }
-                if let Page::Search(page) = &mut self.current_page {
-                    page.set_hotwords(hotwords);
+                match &mut self.current_page {
+                    Page::Home(page) => page.search_mut().set_hotwords(hotwords),
+                    Page::Search(page) => page.set_hotwords(hotwords),
+                    _ => {}
                 }
             }
             network::NetworkEvent::SearchLoaded {
@@ -45,18 +55,35 @@ impl App {
                 if !self.is_latest_request("search", req_id) {
                     return;
                 }
-                if let Page::Search(search_page) = &mut self.current_page {
-                    if search_page.query != keyword {
-                        return;
+                match &mut self.current_page {
+                    Page::Home(home_page) => {
+                        let search_page = home_page.search_mut();
+                        if search_page.query != keyword {
+                            return;
+                        }
+                        if page <= 1 {
+                            search_page.page = 1;
+                            search_page.set_results(results, total);
+                        } else {
+                            search_page.page = page;
+                            search_page.total_results = total;
+                            search_page.append_results(results);
+                        }
                     }
-                    if page <= 1 {
-                        search_page.page = 1;
-                        search_page.set_results(results, total);
-                    } else {
-                        search_page.page = page;
-                        search_page.total_results = total;
-                        search_page.append_results(results);
+                    Page::Search(search_page) => {
+                        if search_page.query != keyword {
+                            return;
+                        }
+                        if page <= 1 {
+                            search_page.page = 1;
+                            search_page.set_results(results, total);
+                        } else {
+                            search_page.page = page;
+                            search_page.total_results = total;
+                            search_page.append_results(results);
+                        }
                     }
+                    _ => {}
                 }
             }
             network::NetworkEvent::DynamicLoaded {
@@ -157,11 +184,154 @@ impl App {
                             video.format_views(),
                             video.format_duration(),
                             video.cover_url(),
-                        );
+                        )
+                        .with_uploader_mid(video.owner.as_ref().and_then(|owner| owner.mid));
                         page.related_card_grid.add_card(card);
                     }
                     page.loading = false;
                     page.error_message = None;
+                }
+            }
+            network::NetworkEvent::UpPageLoaded {
+                req_id,
+                mid,
+                order,
+                profile,
+                relation,
+                videos,
+                folders,
+            } => {
+                if !self.is_latest_request("up_page", req_id) {
+                    return;
+                }
+                if let Page::Up(page) = &mut self.current_page
+                    && page.mid == mid
+                    && page.video_order == order
+                {
+                    page.apply_initial(profile, relation, videos, folders);
+                }
+            }
+            network::NetworkEvent::UpVideosLoaded {
+                req_id,
+                mid,
+                page: loaded_page,
+                order,
+                videos,
+            } => {
+                if !self.is_latest_request("up_videos", req_id) {
+                    return;
+                }
+                if let Page::Up(page) = &mut self.current_page
+                    && page.mid == mid
+                    && page.video_order == order
+                {
+                    if loaded_page == 1 {
+                        page.videos.clear();
+                    }
+                    page.apply_more_videos(loaded_page, videos);
+                    page.loading = false;
+                }
+            }
+            network::NetworkEvent::FavoriteResourcesLoaded {
+                req_id,
+                owner_mid,
+                media_id,
+                page: loaded_page,
+                order,
+                resources,
+            } => {
+                if !self.is_latest_request("favorite_resources", req_id) {
+                    return;
+                }
+                if let Page::Up(page) = &mut self.current_page
+                    && page.mid == owner_mid
+                    && page.favorite_order == order
+                    && (page.pending_folder == Some(media_id)
+                        || page.active_folder == Some(media_id))
+                {
+                    page.apply_favorite_resources(media_id, loaded_page, resources);
+                }
+            }
+            network::NetworkEvent::PlaylistLoaded {
+                req_id,
+                items,
+                source,
+                start_index,
+                order,
+            } => {
+                if self.is_latest_request("playlist_build", req_id) {
+                    self.pending_playlist = Some((items, source, start_index, order));
+                }
+            }
+            network::NetworkEvent::FavoritesInitLoaded {
+                req_id,
+                mid,
+                watch_later,
+                created,
+                collected,
+            } => {
+                if !self.is_latest_request("favorites_init", req_id) {
+                    return;
+                }
+                if let Page::Favorites(page) = &mut self.current_page
+                    && page.mid == mid
+                {
+                    page.apply_initial(watch_later, created, collected);
+                }
+            }
+            network::NetworkEvent::FavoritesWatchLaterLoaded { req_id, page, data } => {
+                if !self.is_latest_request("favorites_content", req_id) {
+                    return;
+                }
+                if let Page::Favorites(favorites) = &mut self.current_page
+                    && matches!(
+                        favorites.active_source,
+                        crate::api::favorite::FavoriteSource::WatchLater
+                    )
+                {
+                    favorites.apply_watch_later(page, data);
+                }
+            }
+            network::NetworkEvent::FavoritesCreatedLoaded {
+                req_id,
+                media_id,
+                page,
+                data,
+            } => {
+                if !self.is_latest_request("favorites_content", req_id) {
+                    return;
+                }
+                if let Page::Favorites(favorites) = &mut self.current_page
+                    && matches!(
+                        favorites.active_source,
+                        crate::api::favorite::FavoriteSource::Created {
+                            media_id: active_id,
+                            ..
+                        } if active_id == media_id
+                    )
+                {
+                    favorites.apply_created(page, data);
+                }
+            }
+            network::NetworkEvent::FavoritesCollectedLoaded {
+                req_id,
+                season_id,
+                page,
+                data,
+            } => {
+                if !self.is_latest_request("favorites_content", req_id) {
+                    return;
+                }
+                if let Page::Favorites(favorites) = &mut self.current_page
+                    && matches!(
+                        favorites.active_source,
+                        crate::api::favorite::FavoriteSource::Collected {
+                            season_id: active_id,
+                            ..
+                        } if active_id == season_id
+                    )
+                {
+                    favorites.apply_collected(page, data);
                 }
             }
             network::NetworkEvent::DynamicDetailLoaded {
@@ -225,8 +395,14 @@ impl App {
                         page.apply_recommendations_error(format!("加载推荐视频失败: {}", error))
                     }
                     (Page::Home(page), "home_more") => page.apply_load_more_error(),
+                    (Page::Home(page), "hotwords") => page
+                        .search_mut()
+                        .set_hotword_error(format!("加载热搜失败: {}", error)),
                     (Page::Search(page), "hotwords") => {
                         page.set_hotword_error(format!("加载热搜失败: {}", error))
+                    }
+                    (Page::Home(page), "search") => {
+                        page.search_mut().set_error(format!("搜索失败: {}", error))
                     }
                     (Page::Search(page), "search") => {
                         page.set_error(format!("搜索失败: {}", error))
@@ -250,6 +426,20 @@ impl App {
                     (Page::VideoDetail(page), "video_detail") => {
                         page.error_message = Some(format!("加载视频信息失败: {}", error));
                         page.loading = false;
+                    }
+                    (Page::Up(page), "up_page") | (Page::Up(page), "up_videos") => {
+                        page.set_error(format!("加载UP主空间失败: {error}"));
+                    }
+                    (Page::Up(page), "favorite_resources") => {
+                        page.set_error(format!("加载收藏夹失败: {error}"));
+                    }
+                    (_, "playlist_build") => {
+                        self.playback.status = crate::domain::playback::PlaybackStatus::Failed;
+                        self.playback.last_error = Some(format!("加载播放列表失败: {error}"));
+                    }
+                    (Page::Favorites(page), "favorites_init")
+                    | (Page::Favorites(page), "favorites_content") => {
+                        page.set_error(format!("加载收藏失败: {error}"));
                     }
                     (Page::DynamicDetail(page), "dynamic_detail") => {
                         page.error_message = Some(format!("加载动态详情失败: {}", error));

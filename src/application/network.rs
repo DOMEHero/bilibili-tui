@@ -4,27 +4,38 @@ use crate::api::{
     comment::CommentItem,
     dynamic::DynamicItem,
     dynamic::UpListItem,
+    favorite::{
+        CollectedFolder, FavoriteFolder, FavoriteOrder, FavoriteResourceData, FavoriteSource,
+        SeasonArchivesData, WatchLaterData,
+    },
     history::HistoryCursor,
     history::HistoryData,
     live::LiveRoom,
-    recommend::VideoItem,
+    recommend::{HomeFeed, VideoItem},
     search::HotwordItem,
     search::SearchVideoItem,
+    space::{RelationStat, SpaceInfo, SpaceVideoData, SpaceVideoOrder},
     video::RelatedVideoItem,
     video::VideoInfo,
 };
+use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
 use crate::presentation::tui::DynamicTab;
+use futures_util::{StreamExt, stream};
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 
 #[derive(Debug)]
 pub enum NetworkCommand {
+    CancelPending,
     LoadHome {
         req_id: u64,
+        feed: HomeFeed,
         use_guest_feed: bool,
     },
     LoadHomeMore {
         req_id: u64,
         fresh_idx: i32,
+        feed: HomeFeed,
         use_guest_feed: bool,
     },
     LoadHotwords {
@@ -69,6 +80,47 @@ pub enum NetworkCommand {
         bvid: String,
         aid: i64,
     },
+    LoadUpPage {
+        req_id: u64,
+        mid: i64,
+        order: SpaceVideoOrder,
+    },
+    LoadUpVideos {
+        req_id: u64,
+        mid: i64,
+        page: i32,
+        order: SpaceVideoOrder,
+    },
+    LoadFavoriteResources {
+        req_id: u64,
+        owner_mid: i64,
+        media_id: i64,
+        page: i32,
+        order: FavoriteOrder,
+    },
+    BuildUpPlaylist {
+        req_id: u64,
+        mid: i64,
+        name: String,
+        video_order: SpaceVideoOrder,
+        play_order: PlayOrder,
+    },
+    BuildFavoritePlaylist {
+        req_id: u64,
+        media_id: i64,
+        title: String,
+        favorite_order: FavoriteOrder,
+        play_order: PlayOrder,
+    },
+    LoadFavoritesInit {
+        req_id: u64,
+        mid: i64,
+    },
+    LoadFavoritesContent {
+        req_id: u64,
+        source: FavoriteSource,
+        page: i32,
+    },
     LoadDynamicDetail {
         req_id: u64,
         dynamic_id: String,
@@ -87,10 +139,12 @@ pub enum NetworkCommand {
 pub enum NetworkEvent {
     HomeLoaded {
         req_id: u64,
+        feed: HomeFeed,
         videos: Vec<VideoItem>,
     },
     HomeMoreLoaded {
         req_id: u64,
+        feed: HomeFeed,
         videos: Vec<VideoItem>,
     },
     HotwordsLoaded {
@@ -129,6 +183,61 @@ pub enum NetworkEvent {
         comments: Vec<CommentItem>,
         has_more_comments: bool,
         related_videos: Vec<RelatedVideoItem>,
+    },
+    UpPageLoaded {
+        req_id: u64,
+        mid: i64,
+        order: SpaceVideoOrder,
+        profile: SpaceInfo,
+        relation: Option<RelationStat>,
+        videos: SpaceVideoData,
+        folders: Vec<FavoriteFolder>,
+    },
+    UpVideosLoaded {
+        req_id: u64,
+        mid: i64,
+        page: i32,
+        order: SpaceVideoOrder,
+        videos: SpaceVideoData,
+    },
+    FavoriteResourcesLoaded {
+        req_id: u64,
+        owner_mid: i64,
+        media_id: i64,
+        page: i32,
+        order: FavoriteOrder,
+        resources: FavoriteResourceData,
+    },
+    PlaylistLoaded {
+        req_id: u64,
+        items: Vec<PlaylistItem>,
+        source: PlaylistSource,
+        start_index: usize,
+        order: PlayOrder,
+    },
+    FavoritesInitLoaded {
+        req_id: u64,
+        mid: i64,
+        watch_later: WatchLaterData,
+        created: Vec<FavoriteFolder>,
+        collected: Vec<CollectedFolder>,
+    },
+    FavoritesWatchLaterLoaded {
+        req_id: u64,
+        page: i32,
+        data: WatchLaterData,
+    },
+    FavoritesCreatedLoaded {
+        req_id: u64,
+        media_id: i64,
+        page: i32,
+        data: FavoriteResourceData,
+    },
+    FavoritesCollectedLoaded {
+        req_id: u64,
+        season_id: i64,
+        page: i32,
+        data: SeasonArchivesData,
     },
     DynamicDetailLoaded {
         req_id: u64,
@@ -175,11 +284,30 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
                 Err(_) => return,
             };
 
+            let mut cancellations =
+                HashMap::<&'static str, tokio_util::sync::CancellationToken>::new();
             while let Ok(command) = command_rx.recv() {
-                let event = runtime.block_on(handle_command(api_client.clone(), command));
-                if event_tx.send(event).is_err() {
-                    break;
+                if matches!(command, NetworkCommand::CancelPending) {
+                    for (_, token) in cancellations.drain() {
+                        token.cancel();
+                    }
+                    continue;
                 }
+                let key = command.cancel_key();
+                let token = tokio_util::sync::CancellationToken::new();
+                if let Some(previous) = cancellations.insert(key, token.clone()) {
+                    previous.cancel();
+                }
+                let api_client = api_client.clone();
+                let event_tx = event_tx.clone();
+                runtime.spawn(async move {
+                    tokio::select! {
+                        _ = token.cancelled() => {}
+                        event = handle_command(api_client, command) => {
+                            let _ = event_tx.send(event);
+                        }
+                    }
+                });
             }
         })
         .expect("failed to spawn network worker");
@@ -190,30 +318,80 @@ pub fn start_network_worker(api_client: Arc<ApiClient>) -> NetworkBridge {
     }
 }
 
+impl NetworkCommand {
+    fn cancel_key(&self) -> &'static str {
+        match self {
+            Self::LoadHome { .. } | Self::LoadHomeMore { .. } => "home",
+            Self::LoadFavoriteResources { .. }
+            | Self::LoadFavoritesInit { .. }
+            | Self::LoadFavoritesContent { .. } => "favorites",
+            Self::BuildUpPlaylist { .. } | Self::BuildFavoritePlaylist { .. } => "playlist",
+            Self::CancelPending => "cancel",
+            Self::LoadHotwords { .. } | Self::Search { .. } => "search",
+            Self::LoadDynamicInit { .. }
+            | Self::LoadDynamicRefresh { .. }
+            | Self::LoadDynamicMore { .. } => "dynamic",
+            Self::LoadHistoryInit { .. } | Self::LoadHistoryMore { .. } => "history",
+            Self::LoadLiveInit { .. } | Self::LoadLiveMore { .. } => "live",
+            Self::LoadVideoDetail { .. } => "video_detail",
+            Self::LoadUpPage { .. } | Self::LoadUpVideos { .. } => "up",
+            Self::LoadDynamicDetail { .. } => "dynamic_detail",
+            Self::LoadBangumiIndex { .. } | Self::LoadBangumiDetail { .. } => "bangumi",
+        }
+    }
+}
+
 async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> NetworkEvent {
     match command {
+        NetworkCommand::CancelPending => unreachable!("handled by worker"),
         NetworkCommand::LoadHome {
             req_id,
+            feed,
             use_guest_feed,
-        } => match if use_guest_feed {
-            api_client.get_popular_videos(1, 20).await
-        } else {
-            api_client.get_recommendations().await
-        } {
-            Ok(videos) => NetworkEvent::HomeLoaded { req_id, videos },
-            Err(e) => failed(req_id, "home", e),
-        },
+        } => {
+            let result = match (feed, use_guest_feed) {
+                (HomeFeed::Recommended, false) => api_client.get_recommendations().await,
+                (HomeFeed::Recommended, true) | (HomeFeed::Popular, _) => {
+                    api_client.get_popular_videos(1, 20).await
+                }
+                _ => api_client.get_home_feed(feed, 1, 20).await,
+            };
+            match result {
+                Ok(mut videos) => {
+                    enrich_followers(&api_client, &mut videos).await;
+                    NetworkEvent::HomeLoaded {
+                        req_id,
+                        feed,
+                        videos,
+                    }
+                }
+                Err(e) => failed(req_id, "home", e),
+            }
+        }
         NetworkCommand::LoadHomeMore {
             req_id,
             fresh_idx,
+            feed,
             use_guest_feed,
         } => {
-            match if use_guest_feed {
-                api_client.get_popular_videos(fresh_idx, 20).await
-            } else {
-                api_client.get_recommendations_paged(fresh_idx).await
-            } {
-                Ok(videos) => NetworkEvent::HomeMoreLoaded { req_id, videos },
+            let result = match (feed, use_guest_feed) {
+                (HomeFeed::Recommended, false) => {
+                    api_client.get_recommendations_paged(fresh_idx).await
+                }
+                (HomeFeed::Recommended, true) | (HomeFeed::Popular, _) => {
+                    api_client.get_popular_videos(fresh_idx, 20).await
+                }
+                _ => api_client.get_home_feed(feed, fresh_idx, 20).await,
+            };
+            match result {
+                Ok(mut videos) => {
+                    enrich_followers(&api_client, &mut videos).await;
+                    NetworkEvent::HomeMoreLoaded {
+                        req_id,
+                        feed,
+                        videos,
+                    }
+                }
                 Err(e) => failed(req_id, "home_more", e),
             }
         }
@@ -234,6 +412,213 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
                 total: data.num_results.unwrap_or(0),
             },
             Err(e) => failed(req_id, "search", e),
+        },
+        NetworkCommand::LoadUpPage { req_id, mid, order } => {
+            match api_client.get_space_info(mid).await {
+                Ok(profile) => {
+                    let relation = api_client.get_relation_stat(mid).await.ok();
+                    let folders = api_client
+                        .get_favorite_folders(mid)
+                        .await
+                        .unwrap_or_default();
+                    match api_client.get_space_videos(mid, 1, 40, order).await {
+                        Ok(videos) => NetworkEvent::UpPageLoaded {
+                            req_id,
+                            mid,
+                            order,
+                            profile,
+                            relation,
+                            videos,
+                            folders,
+                        },
+                        Err(error) => failed(req_id, "up_page", error),
+                    }
+                }
+                Err(error) => failed(req_id, "up_page", error),
+            }
+        }
+        NetworkCommand::LoadUpVideos {
+            req_id,
+            mid,
+            page,
+            order,
+        } => match api_client.get_space_videos(mid, page, 40, order).await {
+            Ok(videos) => NetworkEvent::UpVideosLoaded {
+                req_id,
+                mid,
+                page,
+                order,
+                videos,
+            },
+            Err(error) => failed(req_id, "up_videos", error),
+        },
+        NetworkCommand::LoadFavoriteResources {
+            req_id,
+            owner_mid,
+            media_id,
+            page,
+            order,
+        } => match api_client
+            .get_favorite_resources(media_id, page, 40, order)
+            .await
+        {
+            Ok(resources) => NetworkEvent::FavoriteResourcesLoaded {
+                req_id,
+                owner_mid,
+                media_id,
+                page,
+                order,
+                resources,
+            },
+            Err(error) => failed(req_id, "favorite_resources", error),
+        },
+        NetworkCommand::BuildUpPlaylist {
+            req_id,
+            mid,
+            name,
+            video_order,
+            play_order,
+        } => {
+            let mut items = Vec::new();
+            let mut page = 1;
+            loop {
+                let data = match api_client
+                    .get_space_videos(mid, page, 40, video_order)
+                    .await
+                {
+                    Ok(data) => data,
+                    Err(error) => return failed(req_id, "playlist_build", error),
+                };
+                let total = data.page.count as usize;
+                let empty = data.list.vlist.is_empty();
+                items.extend(data.list.vlist.into_iter().map(|video| PlaylistItem {
+                    bvid: video.bvid,
+                    aid: video.aid,
+                    cid: None,
+                    title: video.title,
+                    uploader_mid: Some(video.mid.unwrap_or(mid)),
+                    duration: video.duration,
+                    page: None,
+                }));
+                if empty || items.len() >= total {
+                    break;
+                }
+                page += 1;
+            }
+            let start_index = if play_order == PlayOrder::Reverse {
+                items.len().saturating_sub(1)
+            } else {
+                0
+            };
+            NetworkEvent::PlaylistLoaded {
+                req_id,
+                items,
+                source: PlaylistSource::Uploader { mid, name },
+                start_index,
+                order: play_order,
+            }
+        }
+        NetworkCommand::BuildFavoritePlaylist {
+            req_id,
+            media_id,
+            title,
+            favorite_order,
+            play_order,
+        } => {
+            let mut items = Vec::new();
+            let mut page = 1;
+            loop {
+                let data = match api_client
+                    .get_favorite_resources(media_id, page, 40, favorite_order)
+                    .await
+                {
+                    Ok(data) => data,
+                    Err(error) => return failed(req_id, "playlist_build", error),
+                };
+                let has_more = data.has_more.unwrap_or(false);
+                items.extend(data.medias.into_iter().filter_map(|media| {
+                    Some(PlaylistItem {
+                        bvid: media.bvid?,
+                        aid: media.id,
+                        cid: None,
+                        title: media.title,
+                        uploader_mid: media.upper.as_ref().map(|upper| upper.mid),
+                        duration: media.duration,
+                        page: None,
+                    })
+                }));
+                if !has_more {
+                    break;
+                }
+                page += 1;
+            }
+            let start_index = if play_order == PlayOrder::Reverse {
+                items.len().saturating_sub(1)
+            } else {
+                0
+            };
+            NetworkEvent::PlaylistLoaded {
+                req_id,
+                items,
+                source: PlaylistSource::Favorites { media_id, title },
+                start_index,
+                order: play_order,
+            }
+        }
+        NetworkCommand::LoadFavoritesInit { req_id, mid } => {
+            match api_client.get_watch_later(1, 20).await {
+                Ok(watch_later) => {
+                    let created = api_client
+                        .get_favorite_folders(mid)
+                        .await
+                        .unwrap_or_default();
+                    match api_client.get_collected_folders(mid, 1, 50).await {
+                        Ok(collected) => NetworkEvent::FavoritesInitLoaded {
+                            req_id,
+                            mid,
+                            watch_later,
+                            created,
+                            collected: collected.list,
+                        },
+                        Err(error) => failed(req_id, "favorites_init", error),
+                    }
+                }
+                Err(error) => failed(req_id, "favorites_init", error),
+            }
+        }
+        NetworkCommand::LoadFavoritesContent {
+            req_id,
+            source,
+            page,
+        } => match source {
+            FavoriteSource::WatchLater => match api_client.get_watch_later(page, 20).await {
+                Ok(data) => NetworkEvent::FavoritesWatchLaterLoaded { req_id, page, data },
+                Err(error) => failed(req_id, "favorites_content", error),
+            },
+            FavoriteSource::Created { media_id, .. } => match api_client
+                .get_favorite_resources(media_id, page, 40, FavoriteOrder::RecentlyFavorited)
+                .await
+            {
+                Ok(data) => NetworkEvent::FavoritesCreatedLoaded {
+                    req_id,
+                    media_id,
+                    page,
+                    data,
+                },
+                Err(error) => failed(req_id, "favorites_content", error),
+            },
+            FavoriteSource::Collected { season_id, mid, .. } => match api_client
+                .get_collected_season_videos(mid, season_id, page, 30)
+                .await
+            {
+                Ok(data) => NetworkEvent::FavoritesCollectedLoaded {
+                    req_id,
+                    season_id,
+                    page,
+                    data,
+                },
+                Err(error) => failed(req_id, "favorites_content", error),
+            },
         },
         NetworkCommand::LoadDynamicInit {
             req_id,
@@ -323,7 +708,11 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
             Err(e) => failed(req_id, "history_more", e),
         },
         NetworkCommand::LoadLiveInit { req_id } => {
-            match api_client.get_live_recommendations().await {
+            let rooms = match api_client.get_live_home_rooms().await {
+                Ok(rooms) => Ok(rooms),
+                Err(_) => api_client.get_live_recommendations().await,
+            };
+            match rooms {
                 Ok(rooms) => NetworkEvent::LiveLoaded {
                     req_id,
                     append: false,
@@ -436,10 +825,94 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
     }
 }
 
+async fn enrich_followers(api_client: &Arc<ApiClient>, videos: &mut [VideoItem]) {
+    let mids = videos
+        .iter()
+        .filter_map(|video| video.owner.as_ref().map(|owner| owner.mid))
+        .filter(|mid| *mid > 0)
+        .collect::<std::collections::BTreeSet<_>>();
+    let followers = stream::iter(mids)
+        .map(|mid| {
+            let client = Arc::clone(api_client);
+            async move {
+                let follower = client
+                    .get_relation_stat(mid)
+                    .await
+                    .ok()
+                    .and_then(|stat| stat.follower);
+                (mid, follower)
+            }
+        })
+        .buffer_unordered(6)
+        .collect::<HashMap<_, _>>()
+        .await;
+    for video in videos {
+        if let Some(owner) = video.owner.as_mut() {
+            owner.follower = followers.get(&owner.mid).copied().flatten();
+        }
+    }
+}
+
 fn failed(req_id: u64, target: &'static str, error: anyhow::Error) -> NetworkEvent {
+    let safe_error = redact_url_queries(&error.to_string());
+    if let Some(mut dir) = dirs::config_dir() {
+        dir.push("bilibili-tui");
+        let log_path = dir.join("debug.log");
+        if std::fs::create_dir_all(&dir).is_ok()
+            && let Ok(mut log) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600));
+            }
+            use std::io::Write;
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let safe_log_error = redact_url_queries(&format!("{error:#}"));
+            let _ = writeln!(
+                log,
+                "[{timestamp}] Network request failed\nTarget: {target}\nRequest ID: {req_id}\nError: {safe_log_error}\n"
+            );
+        }
+    }
+
     NetworkEvent::RequestFailed {
         req_id,
         target,
-        error: error.to_string(),
+        error: safe_error,
+    }
+}
+
+pub(crate) fn redact_url_queries(message: &str) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(ch) = chars.next() {
+        output.push(ch);
+        if ch == '?' {
+            output.push_str("<redacted>");
+            while chars
+                .peek()
+                .is_some_and(|next| !next.is_whitespace() && !matches!(next, '"' | '\''))
+            {
+                chars.next();
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::redact_url_queries;
+
+    #[test]
+    fn network_log_redacts_url_query_parameters() {
+        let value =
+            redact_url_queries("GET https://cdn.example/video?token=secret&expires=1 failed");
+        assert_eq!(value, "GET https://cdn.example/video?<redacted> failed");
+        assert!(!value.contains("secret"));
     }
 }

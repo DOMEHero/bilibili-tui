@@ -19,6 +19,8 @@ pub struct CoverResult {
 pub struct VideoCard {
     pub bvid: Option<String>,
     pub aid: Option<i64>,
+    /// Bilibili member ID of the uploader. This is not the video's aid.
+    pub uploader_mid: Option<i64>,
     pub title: String,
     pub author: String,
     pub views: String,
@@ -40,6 +42,7 @@ impl VideoCard {
         Self {
             bvid,
             aid,
+            uploader_mid: None,
             title,
             author,
             views,
@@ -47,6 +50,11 @@ impl VideoCard {
             pic_url,
             cover: None,
         }
+    }
+
+    pub fn with_uploader_mid(mut self, uploader_mid: Option<i64>) -> Self {
+        self.uploader_mid = uploader_mid;
+        self
     }
 
     /// Render a single video card
@@ -158,6 +166,50 @@ impl VideoCard {
             .alignment(Alignment::Center);
         frame.render_widget(info, info_area);
     }
+
+    fn render_list(&mut self, frame: &mut Frame, area: Rect, is_selected: bool, theme: &Theme) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(if is_selected {
+                theme.bilibili_pink
+            } else {
+                theme.border_subtle
+            }));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(24), Constraint::Min(24)])
+            .split(inner);
+        if let Some(cover) = self.cover.as_mut() {
+            frame.render_stateful_widget(StatefulImage::new(), chunks[0], cover);
+        } else {
+            frame.render_widget(Paragraph::new("📺").alignment(Alignment::Center), chunks[0]);
+        }
+        let style = if is_selected {
+            Style::default()
+                .fg(theme.fg_primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg_secondary)
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(self.title.clone(), style),
+                Line::styled(
+                    self.author.clone(),
+                    Style::default().fg(theme.bilibili_cyan),
+                ),
+                Line::styled(
+                    format!("▶ {}   {}", self.views, self.duration),
+                    Style::default().fg(theme.fg_muted),
+                ),
+            ])
+            .wrap(Wrap { trim: true }),
+            chunks[1],
+        );
+    }
 }
 
 /// Video card grid manager for async cover loading
@@ -172,6 +224,7 @@ pub struct VideoCardGrid {
     pub cover_rx: mpsc::Receiver<CoverResult>,
     pub pending_downloads: HashSet<usize>,
     pub cached_visible_rows: usize,
+    pub list_layout: bool,
 }
 
 impl VideoCardGrid {
@@ -190,7 +243,16 @@ impl VideoCardGrid {
             cover_rx,
             pending_downloads: HashSet::new(),
             cached_visible_rows: 3,
+            list_layout: false,
         }
+    }
+
+    pub fn new_list() -> Self {
+        let mut grid = Self::new();
+        grid.columns = 1;
+        grid.card_height = 7;
+        grid.list_layout = true;
+        grid
     }
 
     pub fn clear(&mut self) {
@@ -263,6 +325,37 @@ impl VideoCardGrid {
             return true;
         }
         false
+    }
+
+    /// Move the selection by one visible viewport.
+    pub fn move_page_down(&mut self) -> bool {
+        self.move_page(true)
+    }
+
+    /// Move the selection backwards by one visible viewport.
+    pub fn move_page_up(&mut self) -> bool {
+        self.move_page(false)
+    }
+
+    fn move_page(&mut self, down: bool) -> bool {
+        let Some(last_index) = self.cards.len().checked_sub(1) else {
+            return false;
+        };
+        let page_size = self
+            .cached_visible_rows
+            .max(1)
+            .saturating_mul(self.columns.max(1));
+        let old_index = self.selected_index;
+        self.selected_index = if down {
+            old_index.saturating_add(page_size).min(last_index)
+        } else {
+            old_index.saturating_sub(page_size)
+        };
+        if self.selected_index == old_index {
+            return false;
+        }
+        self.update_scroll(self.cached_visible_rows.max(1));
+        true
     }
 
     /// Check if near bottom for pagination
@@ -365,7 +458,26 @@ impl VideoCardGrid {
 
         for (video_idx, col_area) in card_areas {
             let is_selected = video_idx == self.selected_index;
-            self.cards[video_idx].render(frame, col_area, is_selected, theme);
+            if self.list_layout {
+                self.cards[video_idx].render_list(frame, col_area, is_selected, theme);
+            } else {
+                self.cards[video_idx].render(frame, col_area, is_selected, theme);
+            }
+        }
+    }
+
+    pub fn select_at(&mut self, row: u16, area: Rect) -> bool {
+        if !area.contains(Position::new(area.x, row)) || row < area.y {
+            return false;
+        }
+        let visible_row = ((row - area.y) / self.card_height) as usize;
+        let index = (self.scroll_row + visible_row) * self.columns;
+        if index < self.cards.len() {
+            self.selected_index = index;
+            self.update_scroll(self.cached_visible_rows);
+            true
+        } else {
+            false
         }
     }
 
@@ -384,4 +496,33 @@ async fn download_image(url: &str) -> Option<DynamicImage> {
     let response = reqwest::get(url).await.ok()?;
     let bytes = response.bytes().await.ok()?;
     image::load_from_memory(&bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_navigation_moves_by_one_viewport() {
+        let mut grid = VideoCardGrid::new_list();
+        for index in 0..8 {
+            grid.add_card(VideoCard::new(
+                None,
+                None,
+                format!("video-{index}"),
+                "up".to_string(),
+                "0".to_string(),
+                "00:00".to_string(),
+                None,
+            ));
+        }
+        grid.cached_visible_rows = 3;
+
+        assert!(grid.move_page_down());
+        assert_eq!(grid.selected_index, 3);
+        assert!(grid.move_page_down());
+        assert_eq!(grid.selected_index, 6);
+        assert!(grid.move_page_up());
+        assert_eq!(grid.selected_index, 3);
+    }
 }

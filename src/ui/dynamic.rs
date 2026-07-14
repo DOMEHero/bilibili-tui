@@ -59,6 +59,7 @@ pub struct DynamicPage {
     pub tab_offsets: HashMap<DynamicTab, Option<String>>,
     pub up_list: Vec<crate::api::dynamic::UpListItem>,
     pub selected_up_index: usize,
+    pub focus_up_list: bool,
     pub loading_up_list: bool,
     pub up_list_scroll_offset: usize,
     pub dynamic_items: Vec<DynamicItem>,
@@ -69,7 +70,7 @@ pub struct DynamicPage {
 impl DynamicPage {
     pub fn new() -> Self {
         Self {
-            grid: VideoCardGrid::new(),
+            grid: VideoCardGrid::new_list(),
             loading: true,
             error_message: None,
             offset: None,
@@ -79,6 +80,7 @@ impl DynamicPage {
             tab_offsets: HashMap::new(),
             up_list: Vec::new(),
             selected_up_index: 0,
+            focus_up_list: true,
             loading_up_list: false,
             up_list_scroll_offset: 0,
             dynamic_items: Vec::new(),
@@ -363,108 +365,52 @@ impl Default for DynamicPage {
     }
 }
 
-impl Component for DynamicPage {
-    fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // UP master selection bar
-                Constraint::Length(5), // Header with tabs
-                Constraint::Min(10),   // Grid
-                Constraint::Length(2), // Help
-            ])
-            .split(area);
-
-        // UP master selection bar
-        const VISIBLE_UPS: usize = 10;
-        let mut up_spans: Vec<Span> = Vec::new();
-
-        // Show left indicator if scrolled
-        if self.up_list_scroll_offset > 0 {
-            up_spans.push(Span::styled("◀ ", Style::default().fg(theme.fg_secondary)));
-        }
-
-        // "全部" button - always visible
-        if self.selected_up_index == 0 {
-            up_spans.push(Span::styled(
-                " [全部] ",
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .add_modifier(Modifier::BOLD)
-                    .add_modifier(Modifier::UNDERLINED),
-            ));
-        } else {
-            up_spans.push(Span::styled(
-                " [全部] ",
-                Style::default().fg(Color::Rgb(120, 120, 120)),
-            ));
-        }
-
-        // Show UPs from scroll offset, limited to VISIBLE_UPS
-        for (i, user) in self
-            .up_list
-            .iter()
-            .enumerate()
-            .skip(self.up_list_scroll_offset)
-            .take(VISIBLE_UPS)
-        {
-            let actual_index = i + 1; // +1 because index 0 is "全部"
-            let is_selected = self.selected_up_index == actual_index;
-            let name = &user.uname;
-            // Add update indicator (●) for UPs with recent updates
-            let text = if user.has_update {
-                format!(" ● {} ", name)
-            } else {
-                format!(" {} ", name)
-            };
-
-            if is_selected {
-                up_spans.push(Span::styled(
-                    text,
-                    Style::default()
-                        .fg(theme.fg_accent)
-                        .add_modifier(Modifier::BOLD)
-                        .add_modifier(Modifier::UNDERLINED),
-                ));
-            } else {
-                let color = if user.has_update {
-                    theme.info // Light blue for unselected with update
-                } else {
-                    theme.fg_secondary // Gray for no update
-                };
-                up_spans.push(Span::styled(text, Style::default().fg(color)));
-            }
-        }
-
-        // Show right indicator if more UPs exist
-        if self.up_list_scroll_offset + VISIBLE_UPS < self.up_list.len() {
-            up_spans.push(Span::styled(" ▶", Style::default().fg(theme.fg_secondary)));
-        }
-
-        let up_bar = Paragraph::new(Line::from(up_spans))
+impl DynamicPage {
+    fn draw_up_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let mut items = vec![ListItem::new("全部")];
+        items.extend(self.up_list.iter().map(|user| {
+            let marker = if user.has_update { "● " } else { "  " };
+            ListItem::new(format!("{marker}{}", user.uname))
+        }));
+        let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .title(Span::styled(
-                        " 关注的UP主 ",
-                        Style::default().fg(theme.bilibili_pink),
-                    ))
-                    .border_style(Style::default().fg(theme.border_subtle)),
+                    .border_style(Style::default().fg(theme.border_subtle))
+                    .title(" 关注的UP主 "),
             )
-            .alignment(Alignment::Left);
-        frame.render_widget(up_bar, chunks[0]);
+            .highlight_symbol("▶ ")
+            .highlight_style(Style::default().fg(if self.focus_up_list {
+                theme.bilibili_pink
+            } else {
+                theme.bilibili_cyan
+            }));
+        let mut state = ListState::default().with_selected(Some(self.selected_up_index));
+        frame.render_stateful_widget(list, area, &mut state);
+    }
+}
 
-        // Header with tab bar
-        let header_chunks = Layout::default()
+impl Component for DynamicPage {
+    fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .split(area);
+        self.draw_up_list(frame, panes[0], theme);
+
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2), // Title line
-                Constraint::Length(3), // Tab bar
+                Constraint::Length(5),
+                Constraint::Min(10),
+                Constraint::Length(2),
             ])
-            .split(chunks[1]);
-
-        // Title
+            .split(panes[1]);
+        let header_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Length(3)])
+            .split(chunks[0]);
         let title = Paragraph::new(Line::from(vec![
             Span::styled(" 📺 ", Style::default()),
             Span::styled(
@@ -479,105 +425,73 @@ impl Component for DynamicPage {
                 Span::raw("")
             },
         ]))
-        .block(
-            Block::default()
-                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border_subtle)),
-        )
-        .alignment(Alignment::Center);
+        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT));
         frame.render_widget(title, header_chunks[0]);
 
-        // Tab bar
-        let mut tab_spans = Vec::new();
-        for (i, tab) in DynamicTab::all_tabs().iter().enumerate() {
-            if i > 0 {
-                tab_spans.push(Span::raw("  "));
-            }
-
-            let is_active = *tab == self.current_tab;
-            let tab_text = format!("[{}] {}", i + 1, tab.label());
-
-            if is_active {
-                tab_spans.push(Span::styled(
-                    tab_text,
+        let tabs = DynamicTab::all_tabs()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, tab)| {
+                let prefix = (index > 0).then_some(Span::raw("  "));
+                let style = if *tab == self.current_tab {
                     Style::default()
                         .fg(theme.fg_accent)
-                        .add_modifier(Modifier::BOLD)
-                        .add_modifier(Modifier::UNDERLINED),
-                ));
-            } else {
-                tab_spans.push(Span::styled(
-                    tab_text,
-                    Style::default().fg(theme.fg_secondary),
-                ));
-            }
-        }
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(theme.fg_secondary)
+                };
+                [
+                    prefix,
+                    Some(Span::styled(
+                        format!("[{}] {}", index + 1, tab.label()),
+                        style,
+                    )),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Line::from(tabs))
+                .block(Block::default().borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT))
+                .alignment(Alignment::Center),
+            header_chunks[1],
+        );
 
-        let tabs = Paragraph::new(Line::from(tab_spans))
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.border_unfocused)),
-            )
-            .alignment(Alignment::Center);
-        frame.render_widget(tabs, header_chunks[1]);
-
-        // Content
         if self.loading {
-            let loading = Paragraph::new("⏳ 加载动态中...")
-                .style(Style::default().fg(theme.warning))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.border_unfocused)),
-                );
-            frame.render_widget(loading, chunks[2]);
-        } else if let Some(ref error) = self.error_message {
-            let error_widget = Paragraph::new(format!("❌ {}", error))
-                .style(Style::default().fg(theme.error))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.border_unfocused)),
-                );
-            frame.render_widget(error_widget, chunks[2]);
+            frame.render_widget(
+                Paragraph::new("⏳ 加载动态中...")
+                    .style(Style::default().fg(theme.warning))
+                    .alignment(Alignment::Center),
+                chunks[1],
+            );
+        } else if let Some(error) = &self.error_message {
+            frame.render_widget(
+                Paragraph::new(format!("❌ {error}"))
+                    .style(Style::default().fg(theme.error))
+                    .alignment(Alignment::Center),
+                chunks[1],
+            );
         } else if self.grid.cards.is_empty() {
-            let empty = Paragraph::new("暂无动态，请先登录并关注UP主")
-                .style(Style::default().fg(theme.fg_secondary))
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.border_unfocused)),
-                );
-            frame.render_widget(empty, chunks[2]);
+            frame.render_widget(
+                Paragraph::new("暂无动态，请先登录并关注UP主")
+                    .style(Style::default().fg(theme.fg_secondary))
+                    .alignment(Alignment::Center),
+                chunks[1],
+            );
         } else {
-            self.grid.render(frame, chunks[2], theme);
+            self.grid.render(frame, chunks[1], theme);
         }
 
-        // Help
-        let help = Paragraph::new(format!(
-            "{}:卡片导航 | {}/{}:切UP主 | {}/{}/{}:切标签 | {}:切页面 | {}:详情 | {}:刷新",
-            keys.get_nav_keys_display(),
-            keys.up_prev,
-            keys.up_next,
-            keys.tab_1,
-            keys.tab_2,
-            keys.tab_3,
-            keys.nav_next_page,
-            keys.confirm,
-            keys.refresh
-        ))
-        .style(Style::default().fg(theme.fg_secondary))
-        .alignment(Alignment::Center);
-        frame.render_widget(help, chunks[3]);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "[↑/↓] 选择动态  [{}/{}] 翻页  [←/→] 切换面板  [{}] 切标签  [{}] 详情  [{}] 刷新",
+                keys.page_up, keys.page_down, keys.tab_1, keys.confirm, keys.refresh
+            ))
+            .style(Style::default().fg(theme.fg_secondary))
+            .alignment(Alignment::Center),
+            chunks[2],
+        );
     }
 
     fn handle_input_with_modifiers(
@@ -587,8 +501,56 @@ impl Component for DynamicPage {
         keys: &crate::storage::Keybindings,
     ) -> Option<AppAction> {
         let _ = modifiers;
+        if keys.matches_quit(key) {
+            return Some(AppAction::Quit);
+        }
+        if keys.matches_nav_next(key) {
+            return Some(AppAction::NavNext);
+        }
+        if keys.matches_nav_prev(key) {
+            return Some(AppAction::NavPrev);
+        }
 
-        // Card navigation
+        if self.focus_up_list {
+            if keys.matches_down(key) {
+                if self.selected_up_index < self.up_list.len() {
+                    return Some(AppAction::SelectUpMaster(self.selected_up_index + 1));
+                }
+            } else if keys.matches_up(key) {
+                if self.selected_up_index > 0 {
+                    return Some(AppAction::SelectUpMaster(self.selected_up_index - 1));
+                }
+            } else if keys.matches_right(key) || keys.matches_confirm(key) {
+                self.focus_up_list = false;
+            }
+            return Some(AppAction::None);
+        }
+
+        if keys.matches_left(key) {
+            self.focus_up_list = true;
+            if self.loading || self.loading_more {
+                self.loading = false;
+                self.loading_more = false;
+                return Some(AppAction::CancelPendingLoads);
+            }
+            return Some(AppAction::None);
+        }
+
+        if keys.matches_page_down(key) {
+            self.grid.move_page_down();
+            if self.grid.is_near_bottom(self.grid.cached_visible_rows)
+                && !self.loading_more
+                && self.has_more
+            {
+                return Some(AppAction::LoadMoreDynamic);
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_up(key) {
+            self.grid.move_page_up();
+            return Some(AppAction::None);
+        }
+
         if keys.matches_down(key) {
             self.grid.move_down();
             if self.grid.is_near_bottom(3) && !self.loading_more && self.has_more {
@@ -599,36 +561,6 @@ impl Component for DynamicPage {
         if keys.matches_up(key) {
             self.grid.move_up();
             return Some(AppAction::None);
-        }
-        if keys.matches_left(key) {
-            self.grid.move_left();
-            return Some(AppAction::None);
-        }
-        if keys.matches_right(key) {
-            self.grid.move_right();
-            return Some(AppAction::None);
-        }
-
-        // UP master navigation
-        if keys.matches_up_prev(key) {
-            if self.selected_up_index > 0 {
-                return Some(AppAction::SelectUpMaster(self.selected_up_index - 1));
-            }
-            return Some(AppAction::None);
-        }
-        if keys.matches_up_next(key) {
-            if self.selected_up_index < self.up_list.len() {
-                return Some(AppAction::SelectUpMaster(self.selected_up_index + 1));
-            }
-            return Some(AppAction::None);
-        }
-
-        // Page navigation
-        if keys.matches_nav_next(key) {
-            return Some(AppAction::NavNext);
-        }
-        if keys.matches_nav_prev(key) {
-            return Some(AppAction::NavPrev);
         }
 
         // Direct tab access
@@ -643,6 +575,13 @@ impl Component for DynamicPage {
         }
 
         // Open selected card
+        if key == KeyCode::Char('u')
+            && let Some(mid) = self
+                .selected_dynamic_item()
+                .and_then(|item| item.author_mid())
+        {
+            return Some(AppAction::OpenUpPage(mid));
+        }
         if keys.matches_confirm(key) {
             if let Some(card) = self.grid.selected_card() {
                 // Video card - open video detail
@@ -667,16 +606,43 @@ impl Component for DynamicPage {
             return Some(AppAction::RefreshDynamic);
         }
 
-        // Quit
-        if keys.matches_quit(key) {
-            return Some(AppAction::Quit);
-        }
-
         Some(AppAction::None)
     }
 
     fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
         use crossterm::event::MouseEventKind;
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .split(area);
+        let position = ratatui::layout::Position::new(event.column, event.row);
+
+        if panes[0].contains(position) {
+            self.focus_up_list = true;
+            match event.kind {
+                MouseEventKind::ScrollDown if self.selected_up_index < self.up_list.len() => {
+                    return Some(AppAction::SelectUpMaster(self.selected_up_index + 1));
+                }
+                MouseEventKind::ScrollUp if self.selected_up_index > 0 => {
+                    return Some(AppAction::SelectUpMaster(self.selected_up_index - 1));
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let row = event.row.saturating_sub(panes[0].y + 1) as usize;
+                    if row <= self.up_list.len() {
+                        self.focus_up_list = true;
+                        if row != self.selected_up_index {
+                            return Some(AppAction::SelectUpMaster(row));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Some(AppAction::None);
+        }
+        if !panes[1].contains(position) {
+            return None;
+        }
+        self.focus_up_list = false;
 
         match event.kind {
             MouseEventKind::ScrollDown => {
@@ -697,14 +663,13 @@ impl Component for DynamicPage {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3),
                         Constraint::Length(5),
                         Constraint::Min(10),
                         Constraint::Length(2),
                     ])
-                    .split(area);
+                    .split(panes[1]);
 
-                let grid_area = chunks[2];
+                let grid_area = chunks[1];
 
                 if !grid_area.contains(ratatui::layout::Position::new(event.column, event.row)) {
                     return None;
@@ -750,5 +715,33 @@ impl Component for DynamicPage {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_uses_sidebar_up_selection_and_single_column_cards() {
+        let page = DynamicPage::new();
+        assert!(page.focus_up_list);
+        assert_eq!(page.grid.columns, 1);
+        assert!(page.grid.list_layout);
+    }
+
+    #[test]
+    fn dynamic_right_switches_to_the_card_pane() {
+        let mut page = DynamicPage::new();
+        let keys = Keybindings::default();
+        assert!(matches!(
+            page.handle_input_with_modifiers(
+                KeyCode::Right,
+                crossterm::event::KeyModifiers::NONE,
+                &keys
+            ),
+            Some(AppAction::None)
+        ));
+        assert!(!page.focus_up_list);
     }
 }

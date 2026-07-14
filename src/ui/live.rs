@@ -139,7 +139,15 @@ impl LivePage {
     }
 
     pub fn apply_live_more(&mut self, rooms: Vec<LiveRoom>) {
+        let existing = self
+            .rooms
+            .iter()
+            .map(|card| card.room.roomid)
+            .collect::<HashSet<_>>();
         for room in rooms {
+            if existing.contains(&room.roomid) {
+                continue;
+            }
             self.rooms.push(LiveCard {
                 room,
                 cover_image: None,
@@ -273,6 +281,27 @@ impl LivePage {
         }
     }
 
+    fn move_page(&mut self, down: bool) -> bool {
+        let Some(last_index) = self.rooms.len().checked_sub(1) else {
+            return false;
+        };
+        let page_size = self
+            .cached_visible_rows
+            .max(1)
+            .saturating_mul(self.columns.max(1));
+        let old_index = self.selected_index;
+        self.selected_index = if down {
+            old_index.saturating_add(page_size).min(last_index)
+        } else {
+            old_index.saturating_sub(page_size)
+        };
+        if old_index == self.selected_index {
+            return false;
+        }
+        self.update_scroll(self.cached_visible_rows.max(1));
+        true
+    }
+
     fn total_rows(&self) -> usize {
         self.rooms.len().div_ceil(self.columns)
     }
@@ -300,7 +329,7 @@ impl Component for LivePage {
             .split(area);
 
         // Header
-        let header = Paragraph::new("📺 直播推荐")
+        let header = Paragraph::new("📺 关注直播优先 · B站推荐")
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -367,6 +396,15 @@ impl Component for LivePage {
             Span::styled("导航", Style::default().fg(theme.fg_secondary)),
             Span::styled("  [", Style::default().fg(theme.fg_secondary)),
             Span::styled(
+                format!("{}/{}", keys.page_up, keys.page_down),
+                Style::default()
+                    .fg(theme.fg_accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
+            Span::styled("翻页", Style::default().fg(theme.fg_secondary)),
+            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
+            Span::styled(
                 &keys.confirm,
                 Style::default()
                     .fg(theme.success)
@@ -424,6 +462,17 @@ impl Component for LivePage {
         }
         if keys.matches_open_settings(key) {
             return Some(AppAction::SwitchToSettings);
+        }
+        if keys.matches_page_down(key) {
+            self.move_page(true);
+            if self.is_near_bottom(self.cached_visible_rows) && !self.loading_more {
+                return Some(AppAction::LoadMoreLive);
+            }
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_up(key) {
+            self.move_page(false);
+            return Some(AppAction::None);
         }
         if keys.matches_refresh(key) {
             return Some(AppAction::RefreshLive);

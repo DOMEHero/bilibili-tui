@@ -1,1 +1,3 @@
-pub use crate::api::{ApiClient, DanmuHost, DanmuInfoData, LiveClient, LiveMessage};
+pub use crate::api::{
+    ApiClient, DanmuHost, DanmuInfoData, LiveClient, LiveDanmakuHub, LiveMessage,
+};

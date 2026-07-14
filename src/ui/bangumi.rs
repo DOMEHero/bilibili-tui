@@ -99,6 +99,15 @@ impl BangumiPage {
             Span::styled("导航", Style::default().fg(theme.fg_secondary)),
             Span::styled("  [", Style::default().fg(theme.fg_secondary)),
             Span::styled(
+                format!("{}/{}", keys.page_up, keys.page_down),
+                Style::default()
+                    .fg(theme.fg_accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
+            Span::styled("翻页", Style::default().fg(theme.fg_secondary)),
+            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
+            Span::styled(
                 &keys.confirm,
                 Style::default()
                     .fg(theme.success)
@@ -199,6 +208,15 @@ impl Component for BangumiPage {
         }
 
         if self.loading {
+            return Some(AppAction::None);
+        }
+
+        if keys.matches_page_down(key) {
+            self.index_grid.move_page_down();
+            return Some(AppAction::None);
+        }
+        if keys.matches_page_up(key) {
+            self.index_grid.move_page_up();
             return Some(AppAction::None);
         }
 
