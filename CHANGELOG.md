@@ -1,3 +1,17 @@
+## [1.0.12] - 2026-07-14
+
+### 🚀 Features
+
+- 添加 MPV Bilibili SponsorBlock 选项以跳过广告
+- Add Bangumi functionality with timeline and ranking
+- Improve browsing and resilient playback
+- Persist CDN ranking metrics
+- Rank regional CDN catalog
+- *(player)* Optimize danmaku rendering and low-latency playback
+
+### 🐛 Bug Fixes
+
+- Harden playback and playlist lifecycle
 ## [1.0.11] - 2026-04-20
 
 ### 🚀 Features
