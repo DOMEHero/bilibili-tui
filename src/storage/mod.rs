@@ -472,6 +472,8 @@ pub struct AppConfig {
     pub keybindings: Keybindings,
     #[serde(default)]
     pub danmaku: DanmakuConfig,
+    #[serde(default = "default_true")]
+    pub auto_play: bool,
 }
 
 impl Default for AppConfig {
@@ -480,8 +482,13 @@ impl Default for AppConfig {
             theme: "silkcircuit-neon".to_string(),
             keybindings: Keybindings::default(),
             danmaku: DanmakuConfig::default(),
+            auto_play: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Get the config directory path

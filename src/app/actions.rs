@@ -695,6 +695,7 @@ impl App {
                     self.theme_id.clone(),
                     self.credentials.is_some(),
                     self.config.danmaku.clone(),
+                    self.config.auto_play,
                 );
                 self.current_page = Page::Settings(Box::new(page));
             }
@@ -775,6 +776,10 @@ impl App {
                 self.config.danmaku = *danmaku;
                 self.danmaku_config_tx
                     .send_replace(self.config.danmaku.clone());
+                let _ = persistence::save_config(&self.config);
+            }
+            AppAction::SaveAutoPlay(enabled) => {
+                self.config.auto_play = enabled;
                 let _ = persistence::save_config(&self.config);
             }
             AppAction::SwitchToLive => {
@@ -1010,6 +1015,7 @@ impl App {
                         self.theme_id.clone(),
                         false,
                         self.config.danmaku.clone(),
+                        self.config.auto_play,
                     )));
                 }
             }
@@ -1020,6 +1026,7 @@ impl App {
                         self.theme_id.clone(),
                         self.credentials.is_some(),
                         self.config.danmaku.clone(),
+                        self.config.auto_play,
                     );
                     self.current_page = Page::Settings(Box::new(page));
                 }

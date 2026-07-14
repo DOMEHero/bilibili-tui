@@ -105,6 +105,8 @@ pub enum AppAction {
     SaveKeybindings(Box<Keybindings>),
     /// Save live/video danmaku rendering settings.
     SaveDanmakuConfig(Box<DanmakuConfig>),
+    /// Save the auto-play-on-video-open preference.
+    SaveAutoPlay(bool),
     /// Logout and return to login page
     Logout,
     /// Like or unlike a comment (oid, rpid, comment_type)

@@ -272,14 +272,23 @@ impl App {
             }
         }
 
-        let auto_play = if let Page::VideoDetail(page) = &mut self.current_page {
-            if page.auto_play_pending && !page.loading && page.video_info.is_some() {
-                page.auto_play_pending = false;
-                Some((page.bvid.clone(), page.play_action()))
+        let auto_play = if self.config.auto_play {
+            if let Page::VideoDetail(page) = &mut self.current_page {
+                if page.auto_play_pending && !page.loading && page.video_info.is_some() {
+                    page.auto_play_pending = false;
+                    Some((page.bvid.clone(), page.play_action()))
+                } else {
+                    None
+                }
             } else {
                 None
             }
         } else {
+            // Auto-play disabled: clear the pending flag so it doesn't fire
+            // once the user re-enables the setting mid-session.
+            if let Page::VideoDetail(page) = &mut self.current_page {
+                page.auto_play_pending = false;
+            }
             None
         };
         if let Some((bvid, action)) = auto_play {

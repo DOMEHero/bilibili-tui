@@ -10,6 +10,7 @@ use ratatui::{crossterm::event::KeyCode, prelude::*, widgets::*};
 pub enum SettingsSection {
     Theme,
     Danmaku,
+    Playback,
     Keybindings,
     Account,
 }
@@ -19,6 +20,7 @@ impl SettingsSection {
         &[
             SettingsSection::Theme,
             SettingsSection::Danmaku,
+            SettingsSection::Playback,
             SettingsSection::Keybindings,
             SettingsSection::Account,
         ]
@@ -28,6 +30,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Theme => "🎨 主题",
             SettingsSection::Danmaku => "💬 弹幕",
+            SettingsSection::Playback => "▶  播放",
             SettingsSection::Keybindings => "⌨️ 快捷键",
             SettingsSection::Account => "👤 账户",
         }
@@ -44,6 +47,7 @@ pub struct SettingsPage {
     pub theme_choices: Vec<ThemeChoice>,
     pub is_logged_in: bool,
     pub danmaku: DanmakuConfig,
+    pub auto_play: bool,
     section_index: usize,
     pub editing_keybind: bool,
     editing_danmaku: bool,
@@ -56,6 +60,7 @@ impl SettingsPage {
         theme_id: String,
         is_logged_in: bool,
         danmaku: DanmakuConfig,
+        auto_play: bool,
     ) -> Self {
         let theme_choices = Theme::available_theme_choices();
         let theme_index = theme_choices
@@ -73,6 +78,7 @@ impl SettingsPage {
             theme_choices,
             is_logged_in,
             danmaku,
+            auto_play,
             section_index: 0,
             editing_keybind: false,
             editing_danmaku: false,
@@ -124,6 +130,7 @@ impl Default for SettingsPage {
             DEFAULT_THEME_ID.to_string(),
             false,
             DanmakuConfig::default(),
+            true,
         )
     }
 }
@@ -176,6 +183,9 @@ impl Component for SettingsPage {
         match self.current_section {
             SettingsSection::Theme => self.draw_theme_section(frame, content_chunks[1], theme),
             SettingsSection::Danmaku => self.draw_danmaku_section(frame, content_chunks[1], theme),
+            SettingsSection::Playback => {
+                self.draw_playback_section(frame, content_chunks[1], theme)
+            }
             SettingsSection::Keybindings => {
                 self.draw_keybindings_section(frame, content_chunks[1], theme)
             }
@@ -323,7 +333,7 @@ impl Component for SettingsPage {
                 SettingsSection::Danmaku => {
                     self.selected_danmaku_index = self.selected_danmaku_index.saturating_sub(1);
                 }
-                SettingsSection::Account => {}
+                SettingsSection::Playback | SettingsSection::Account => {}
             }
             return Some(AppAction::None);
         }
@@ -345,7 +355,7 @@ impl Component for SettingsPage {
                     self.selected_danmaku_index =
                         (self.selected_danmaku_index + 1).min(Self::DANMAKU_ROWS - 1);
                 }
-                SettingsSection::Account => {}
+                SettingsSection::Playback | SettingsSection::Account => {}
             }
             return Some(AppAction::None);
         }
@@ -371,6 +381,10 @@ impl Component for SettingsPage {
                     }
                     self.danmaku_input = self.current_danmaku_input();
                     self.editing_danmaku = true;
+                }
+                SettingsSection::Playback => {
+                    self.auto_play = !self.auto_play;
+                    return Some(AppAction::SaveAutoPlay(self.auto_play));
                 }
                 SettingsSection::Keybindings => {
                     // Enter keybind editing mode
@@ -566,6 +580,46 @@ impl SettingsPage {
             );
             frame.render_widget(input, chunks[1]);
         }
+    }
+
+    fn draw_playback_section(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border_subtle))
+            .title(Span::styled(
+                " ▶  播放设置 ",
+                Style::default()
+                    .fg(theme.bilibili_pink)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let value_str = if self.auto_play { "开启" } else { "关闭" };
+        let row = format!("▶ 进入视频自动播放：{value_str}");
+        let hint = "  按 Enter 切换";
+
+        let chunks = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(row).style(
+                Style::default()
+                    .fg(theme.fg_primary)
+                    .bg(theme.selection_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(theme.fg_secondary)),
+            chunks[1],
+        );
     }
 
     fn draw_section_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
