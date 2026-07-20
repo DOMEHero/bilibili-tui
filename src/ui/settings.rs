@@ -2,7 +2,7 @@
 
 use super::{Component, DEFAULT_THEME_ID, Theme, ThemeChoice};
 use crate::application::AppAction;
-use crate::storage::{DanmakuConfig, Keybindings};
+use crate::storage::{DanmakuConfig, Keybindings, VideoQuality};
 use ratatui::{crossterm::event::KeyCode, prelude::*, widgets::*};
 
 /// Settings sections
@@ -41,6 +41,7 @@ pub struct SettingsPage {
     pub current_section: SettingsSection,
     pub selected_theme_index: usize,
     pub selected_danmaku_index: usize,
+    pub selected_playback_index: usize,
     pub selected_keybind_index: usize,
     pub keybindings: Keybindings,
     pub current_theme_id: String,
@@ -48,6 +49,7 @@ pub struct SettingsPage {
     pub is_logged_in: bool,
     pub danmaku: DanmakuConfig,
     pub auto_play: bool,
+    pub video_quality: VideoQuality,
     section_index: usize,
     pub editing_keybind: bool,
     editing_danmaku: bool,
@@ -61,6 +63,7 @@ impl SettingsPage {
         is_logged_in: bool,
         danmaku: DanmakuConfig,
         auto_play: bool,
+        video_quality: VideoQuality,
     ) -> Self {
         let theme_choices = Theme::available_theme_choices();
         let theme_index = theme_choices
@@ -72,6 +75,7 @@ impl SettingsPage {
             current_section: SettingsSection::Theme,
             selected_theme_index: theme_index,
             selected_danmaku_index: 0,
+            selected_playback_index: 0,
             selected_keybind_index: 0,
             keybindings,
             current_theme_id: theme_id,
@@ -79,6 +83,7 @@ impl SettingsPage {
             is_logged_in,
             danmaku,
             auto_play,
+            video_quality,
             section_index: 0,
             editing_keybind: false,
             editing_danmaku: false,
@@ -131,6 +136,7 @@ impl Default for SettingsPage {
             false,
             DanmakuConfig::default(),
             true,
+            VideoQuality::Best,
         )
     }
 }
@@ -314,6 +320,11 @@ impl Component for SettingsPage {
             self.current_section = sections[self.section_index];
             return Some(AppAction::None);
         }
+        if (keys.matches_left(key) || keys.matches_right(key))
+            && self.current_section == SettingsSection::Playback
+        {
+            return Some(self.adjust_playback(if keys.matches_right(key) { 1 } else { -1 }));
+        }
         if keys.matches_left(key) || keys.matches_right(key) {
             self.change_section(if keys.matches_right(key) { 1 } else { -1 });
             return Some(AppAction::None);
@@ -333,7 +344,10 @@ impl Component for SettingsPage {
                 SettingsSection::Danmaku => {
                     self.selected_danmaku_index = self.selected_danmaku_index.saturating_sub(1);
                 }
-                SettingsSection::Playback | SettingsSection::Account => {}
+                SettingsSection::Playback => {
+                    self.selected_playback_index = self.selected_playback_index.saturating_sub(1);
+                }
+                SettingsSection::Account => {}
             }
             return Some(AppAction::None);
         }
@@ -355,7 +369,10 @@ impl Component for SettingsPage {
                     self.selected_danmaku_index =
                         (self.selected_danmaku_index + 1).min(Self::DANMAKU_ROWS - 1);
                 }
-                SettingsSection::Playback | SettingsSection::Account => {}
+                SettingsSection::Playback => {
+                    self.selected_playback_index = (self.selected_playback_index + 1).min(1);
+                }
+                SettingsSection::Account => {}
             }
             return Some(AppAction::None);
         }
@@ -383,8 +400,7 @@ impl Component for SettingsPage {
                     self.editing_danmaku = true;
                 }
                 SettingsSection::Playback => {
-                    self.auto_play = !self.auto_play;
-                    return Some(AppAction::SaveAutoPlay(self.auto_play));
+                    return Some(self.adjust_playback(1));
                 }
                 SettingsSection::Keybindings => {
                     // Enter keybind editing mode
@@ -402,6 +418,19 @@ impl Component for SettingsPage {
 
 impl SettingsPage {
     const DANMAKU_ROWS: usize = 9;
+
+    fn adjust_playback(&mut self, direction: i32) -> AppAction {
+        match self.selected_playback_index {
+            0 => {
+                self.auto_play = !self.auto_play;
+                AppAction::SaveAutoPlay(self.auto_play)
+            }
+            _ => {
+                self.video_quality = self.video_quality.cycle(direction);
+                AppAction::SaveVideoQuality(self.video_quality)
+            }
+        }
+    }
 
     fn change_section(&mut self, direction: i32) {
         let sections = SettingsSection::all();
@@ -596,28 +625,38 @@ impl SettingsPage {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let value_str = if self.auto_play { "开启" } else { "关闭" };
-        let row = format!("▶ 进入视频自动播放：{value_str}");
-        let hint = "  按 Enter 切换";
+        let rows = [
+            format!(
+                "进入视频自动播放：{}",
+                if self.auto_play { "开启" } else { "关闭" }
+            ),
+            format!("默认视频画质：{}", self.video_quality.label()),
+        ];
 
         let chunks = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(inner);
 
+        let items = rows.into_iter().enumerate().map(|(index, row)| {
+            let selected = index == self.selected_playback_index;
+            ListItem::new(format!("{}{}", if selected { "▶ " } else { "  " }, row)).style(
+                if selected {
+                    Style::default()
+                        .fg(theme.fg_primary)
+                        .bg(theme.selection_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg_secondary)
+                },
+            )
+        });
+        frame.render_widget(List::new(items), chunks[0]);
         frame.render_widget(
-            Paragraph::new(row).style(
-                Style::default()
-                    .fg(theme.fg_primary)
-                    .bg(theme.selection_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            chunks[0],
-        );
-        frame.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(theme.fg_secondary)),
+            Paragraph::new("  按 ←/→ 或 Enter 更改并立即保存")
+                .style(Style::default().fg(theme.fg_secondary)),
             chunks[1],
         );
     }
@@ -865,5 +904,26 @@ mod tests {
         page.handle_input(KeyCode::Esc, &keys);
         assert!(!page.editing_keybind);
         assert_eq!(page.keybindings.quit, original);
+    }
+
+    #[test]
+    fn playback_rows_save_auto_play_and_quality_immediately() {
+        let keys = Keybindings::default();
+        let mut page = SettingsPage {
+            current_section: SettingsSection::Playback,
+            section_index: 2,
+            ..SettingsPage::default()
+        };
+
+        let action = page.handle_input(KeyCode::Enter, &keys);
+        assert!(matches!(action, Some(AppAction::SaveAutoPlay(false))));
+
+        page.handle_input(KeyCode::Char('j'), &keys);
+        let action = page.handle_input(KeyCode::Char('l'), &keys);
+        assert_eq!(page.video_quality, VideoQuality::Q4k);
+        assert!(matches!(
+            action,
+            Some(AppAction::SaveVideoQuality(VideoQuality::Q4k))
+        ));
     }
 }

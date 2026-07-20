@@ -3,7 +3,7 @@ use crate::api::danmaku::VideoDanmaku;
 use crate::api::live_danmaku_hub::LiveDanmakuHub;
 use crate::api::live_ws::LiveMessage;
 use crate::domain::playback::{PlayOrder, PlaybackEvent, PlaylistItem};
-use crate::storage::{Credentials, DanmakuConfig};
+use crate::storage::{Credentials, DanmakuConfig, VideoQuality};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::io::Write as StdWrite;
@@ -28,6 +28,13 @@ static LIVE_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MPV_IPC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const LIVE_DANMAKU_SCRIPT: &str = include_str!("live_danmaku.lua");
 
+fn ytdl_format(quality: VideoQuality) -> String {
+    match quality.max_height() {
+        None => "bestvideo+bestaudio/best".to_string(),
+        Some(height) => format!("bestvideo[height<={height}]+bestaudio/best[height<={height}]"),
+    }
+}
+
 /// Play a video using mpv with yt-dlp and report watch progress
 /// This function spawns mpv in a background task to avoid blocking the TUI
 #[allow(clippy::too_many_arguments)]
@@ -40,6 +47,7 @@ pub async fn play_video(
     page_num: Option<i32>,
     credentials: Option<&Credentials>,
     danmaku_config: DanmakuConfig,
+    video_quality: VideoQuality,
     playback_event_tx: Sender<PlaybackEvent>,
     session_id: u64,
 ) -> Result<()> {
@@ -53,8 +61,8 @@ pub async fn play_video(
 
     let start_ts = chrono::Utc::now().timestamp();
 
-    let mut media_proxy = match api_client.get_play_url(bvid, cid).await {
-        Ok(play_url) => match crate::api::cdn::rank_streams(&play_url).await {
+    let mut media_proxy = match api_client.get_play_url(bvid, cid, video_quality).await {
+        Ok(play_url) => match crate::api::cdn::rank_streams(&play_url, video_quality).await {
             Ok(streams) => proxy::MediaProxy::start(streams).await.ok(),
             Err(_) => None,
         },
@@ -99,7 +107,7 @@ pub async fn play_video(
         cmd.arg(format!("--audio-file={}", proxy.audio_url));
         cmd.arg(&proxy.video_url);
     } else {
-        cmd.arg("--ytdl-format=bestvideo+bestaudio/best");
+        cmd.arg(format!("--ytdl-format={}", ytdl_format(video_quality)));
         cmd.arg(&webpage_url);
     }
 
@@ -626,17 +634,20 @@ async fn switch_to_working_video_cdn(
 
 /// Start one mpv process with multiple Bilibili URLs. mpv owns automatic
 /// advancement, so window/fullscreen/volume state is preserved between items.
+#[allow(clippy::too_many_arguments)]
 pub async fn play_playlist(
     api_client: Arc<ApiClient>,
     items: Vec<PlaylistItem>,
     order: PlayOrder,
     start_index: usize,
     _credentials: Option<&Credentials>,
+    video_quality: VideoQuality,
     playback_event_tx: Sender<PlaybackEvent>,
     session_id: u64,
 ) -> Result<()> {
     let (items, requested_start) = ordered_playlist(items, order, start_index)?;
-    let (first, skipped) = prepare_next_playlist_item(&api_client, &items, requested_start).await;
+    let (first, skipped) =
+        prepare_next_playlist_item(&api_client, &items, requested_start, video_quality).await;
     let Some((start_index, first)) = first else {
         anyhow::bail!("播放列表没有可播放项目: {}", skipped.join("; "));
     };
@@ -672,6 +683,7 @@ pub async fn play_playlist(
             items,
             start_index,
             first,
+            video_quality,
             playback_event_tx.clone(),
             session_id,
         )
@@ -705,6 +717,7 @@ struct PreparedPlaylistItem {
 async fn prepare_playlist_item(
     api_client: &ApiClient,
     item: &PlaylistItem,
+    video_quality: VideoQuality,
 ) -> Result<PreparedPlaylistItem> {
     let (cid, duration) = match (item.cid, item.duration) {
         (Some(cid), Some(duration)) => (cid, duration),
@@ -716,8 +729,10 @@ async fn prepare_playlist_item(
             )
         }
     };
-    let play_url = api_client.get_play_url(&item.bvid, cid).await?;
-    let streams = crate::api::cdn::rank_streams(&play_url).await?;
+    let play_url = api_client
+        .get_play_url(&item.bvid, cid, video_quality)
+        .await?;
+    let streams = crate::api::cdn::rank_streams(&play_url, video_quality).await?;
     let proxy = proxy::MediaProxy::start(streams).await?;
     Ok(PreparedPlaylistItem {
         cid,
@@ -730,12 +745,13 @@ async fn prepare_next_playlist_item(
     api_client: &ApiClient,
     items: &[PlaylistItem],
     start: usize,
+    video_quality: VideoQuality,
 ) -> (Option<(usize, PreparedPlaylistItem)>, Vec<String>) {
     let mut failures = Vec::new();
     for (index, item) in items.iter().enumerate().skip(start) {
         if let Some(prepared) = accept_prepared_result(
             item,
-            prepare_playlist_item(api_client, item).await,
+            prepare_playlist_item(api_client, item, video_quality).await,
             &mut failures,
         ) {
             return (Some((index, prepared)), failures);
@@ -800,6 +816,7 @@ async fn run_playlist(
     items: Vec<PlaylistItem>,
     mut index: usize,
     mut prepared: PreparedPlaylistItem,
+    video_quality: VideoQuality,
     tx: Sender<PlaybackEvent>,
     session_id: u64,
 ) -> Result<()> {
@@ -893,7 +910,12 @@ async fn run_playlist(
                     played_any = true;
                     if !corrupted { prepared.proxy.record_success(); }
                 }
-                let (next, skipped) = prepare_next_playlist_item(&api_client, &items, index + 1).await;
+                let (next, skipped) = prepare_next_playlist_item(
+                    &api_client,
+                    &items,
+                    index + 1,
+                    video_quality,
+                ).await;
                 log_skipped_playlist_items(&skipped);
                 let Some((next_index, next_prepared)) = next else {
                     let _ = mpv_ipc(ipc_path, serde_json::json!(["quit"])).await;
@@ -1067,10 +1089,24 @@ fn ordered_playlist(
     Ok((items, start_index))
 }
 
-/// Play a bangumi episode using mpv with yt-dlp
-/// This function spawns mpv in a background task to avoid blocking the TUI
-pub async fn play_bangumi_episode(ep_id: i64, credentials: Option<&Credentials>) -> Result<()> {
+/// Play an authenticated bangumi episode, falling back to yt-dlp when the
+/// direct PGC stream cannot be proxied.
+pub async fn play_bangumi_episode(
+    api_client: Arc<ApiClient>,
+    ep_id: i64,
+    credentials: Option<&Credentials>,
+    video_quality: VideoQuality,
+    playback_event_tx: Sender<PlaybackEvent>,
+    session_id: u64,
+) -> Result<()> {
     let video_url = format!("https://www.bilibili.com/bangumi/play/ep{}", ep_id);
+    let media_proxy = match api_client.get_bangumi_play_url(ep_id, video_quality).await {
+        Ok(play_url) => match crate::api::cdn::rank_streams(&play_url, video_quality).await {
+            Ok(streams) => proxy::MediaProxy::start(streams).await.ok(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
 
     let mut cmd = Command::new("mpv");
     cmd.stdout(Stdio::null());
@@ -1087,10 +1123,18 @@ pub async fn play_bangumi_episode(ep_id: i64, credentials: Option<&Credentials>)
         None
     };
 
-    cmd.arg("--ytdl-format=bestvideo+bestaudio/best");
     cmd.arg("--force-window=immediate");
     cmd.arg("--script-opts-append=double_video_fps=yes");
-    cmd.arg(&video_url);
+    cmd.arg(format!("--referrer={video_url}"));
+    cmd.arg(format!("--http-header-fields=Referer: {video_url}"));
+    if let Some(proxy) = &media_proxy {
+        cmd.arg("--ytdl=no");
+        cmd.arg(format!("--audio-file={}", proxy.audio_url));
+        cmd.arg(&proxy.video_url);
+    } else {
+        cmd.arg(format!("--ytdl-format={}", ytdl_format(video_quality)));
+        cmd.arg(&video_url);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -1103,12 +1147,28 @@ pub async fn play_bangumi_episode(ep_id: i64, credentials: Option<&Credentials>)
     };
 
     tokio::spawn(async move {
-        let _ = child.wait().await;
+        let status = child.wait().await;
 
         // Cleanup cookie file
         if let Some(path) = cookie_path_to_clean {
             let _ = crate::storage::remove_cookie_export(&path);
         }
+        drop(media_proxy);
+        let event = match status {
+            Ok(status) if status.success() => PlaybackEvent::Finished {
+                session_id,
+                bvid: None,
+            },
+            Ok(status) => PlaybackEvent::Failed {
+                session_id,
+                error: format!("番剧播放器退出: {status}"),
+            },
+            Err(error) => PlaybackEvent::Failed {
+                session_id,
+                error: format!("番剧播放器失败: {error}"),
+            },
+        };
+        let _ = playback_event_tx.send(event);
     });
 
     Ok(())
@@ -1679,8 +1739,11 @@ mod playlist_tests {
         let client = ApiClient::new();
         let bvid = "BV1cP7j64E37";
         let info = client.get_video_info(bvid).await.expect("video info");
-        let play_url = client.get_play_url(bvid, info.cid).await.expect("playurl");
-        let streams = crate::api::cdn::rank_streams(&play_url)
+        let play_url = client
+            .get_play_url(bvid, info.cid, VideoQuality::Best)
+            .await
+            .expect("playurl");
+        let streams = crate::api::cdn::rank_streams(&play_url, VideoQuality::Best)
             .await
             .expect("rank CDN streams");
         assert!(streams.video.len() > 1, "test needs a backup video CDN");

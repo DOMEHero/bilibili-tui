@@ -1,6 +1,6 @@
 //! Homepage with video recommendations in a grid layout with cover images
 
-use super::{Component, SearchPage, Theme};
+use super::{Component, SearchPage, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::recommend::HomeFeed;
 use crate::api::recommend::VideoItem;
@@ -142,19 +142,28 @@ impl HomePage {
         }
 
         let notice = self.footer_notice.take();
-        let mut help = format!(
-            "[↑/↓] 选择视频  [{} / {}] 翻页  [←/→] 切换面板  [{}] 播放  [{}] 搜索  [{}] 刷新",
-            keys.page_up, keys.page_down, keys.confirm, keys.search_focus, keys.refresh
+        let mut help = shortcut_footer(
+            theme,
+            [
+                ("↑/↓".into(), "选择视频".into(), theme.fg_accent),
+                (
+                    format!("{} / {}", keys.page_up, keys.page_down),
+                    "翻页".into(),
+                    theme.fg_accent,
+                ),
+                ("←/→".into(), "切换面板".into(), theme.fg_accent),
+                (keys.confirm.clone(), "播放".into(), theme.success),
+                (keys.search_focus.clone(), "搜索".into(), theme.info),
+                (keys.refresh.clone(), "刷新".into(), theme.info),
+            ],
         );
         if let Some(notice) = notice {
-            help.push_str(&format!("  {notice}"));
+            help.spans.push(Span::styled(
+                format!("  {notice}"),
+                Style::default().fg(theme.fg_secondary),
+            ));
         }
-        frame.render_widget(
-            Paragraph::new(help)
-                .style(Style::default().fg(theme.fg_secondary))
-                .alignment(Alignment::Center),
-            chunks[2],
-        );
+        frame.render_widget(Paragraph::new(help).alignment(Alignment::Center), chunks[2]);
     }
 }
 

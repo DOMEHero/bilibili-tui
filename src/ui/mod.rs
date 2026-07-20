@@ -1,3 +1,4 @@
+mod article_detail;
 mod bangumi;
 mod bangumi_detail;
 mod dynamic;
@@ -16,6 +17,7 @@ mod up;
 mod video_card;
 mod video_detail;
 
+pub use article_detail::ArticleDetailPage;
 pub use bangumi::BangumiPage;
 pub use bangumi_detail::BangumiDetailPage;
 pub use dynamic::{DynamicPage, DynamicTab};
@@ -39,8 +41,32 @@ use crate::storage::Keybindings;
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyModifiers, MouseEvent},
-    prelude::Rect,
+    prelude::{Color, Line, Modifier, Rect, Span, Style},
 };
+
+/// Build the centered, bracketed shortcut footer used across list pages.
+/// Each tuple is `(shortcut, label, color)`; shortcut text is emphasized while
+/// labels and brackets use the secondary foreground.
+pub fn shortcut_footer(
+    theme: &Theme,
+    items: impl IntoIterator<Item = (String, String, Color)>,
+) -> Line<'static> {
+    let muted = Style::default().fg(theme.fg_secondary);
+    let mut spans = Vec::new();
+    for (index, (shortcut, label, color)) in items.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", muted));
+        }
+        spans.push(Span::styled("[", muted));
+        spans.push(Span::styled(
+            shortcut,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled("] ", muted));
+        spans.push(Span::styled(label, muted));
+    }
+    Line::from(spans)
+}
 
 /// UI Component trait
 pub trait Component {
@@ -71,6 +97,7 @@ pub enum Page {
     Search(SearchPage),
     Dynamic(DynamicPage),
     DynamicDetail(Box<DynamicDetailPage>),
+    ArticleDetail(Box<ArticleDetailPage>),
     VideoDetail(Box<VideoDetailPage>),
     Up(Box<UpPage>),
     History(HistoryPage),

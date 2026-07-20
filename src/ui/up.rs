@@ -1,4 +1,4 @@
-use super::{Component, Theme, VideoCard, VideoCardGrid};
+use super::{Component, Theme, VideoCard, VideoCardGrid, shortcut_footer};
 use crate::api::{
     favorite::{FavoriteFolder, FavoriteOrder, FavoriteResourceData},
     space::{RelationStat, SpaceInfo, SpaceVideoData, SpaceVideoOrder},
@@ -9,7 +9,7 @@ use crate::storage::Keybindings;
 use ratatui::{
     Frame,
     crossterm::event::KeyCode,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
@@ -291,13 +291,23 @@ impl Component for UpPage {
         }
 
         frame.render_widget(
-            Paragraph::new(format!(
-                "[1/2] 投稿/收藏夹  [{}/{}] 翻页  [o] 最新/热门  [s] 顺序/倒序/随机  [{}] 连播  [Enter] 打开  [{}] 返回",
-                keys.page_up,
-                keys.page_down,
-                keys.play,
-                keys.back
-            )),
+            Paragraph::new(shortcut_footer(
+                theme,
+                [
+                    ("1/2".into(), "投稿/收藏夹".into(), theme.info),
+                    (
+                        format!("{}/{}", keys.page_up, keys.page_down),
+                        "翻页".into(),
+                        theme.fg_accent,
+                    ),
+                    ("o".into(), "最新/热门".into(), theme.info),
+                    ("s".into(), "顺序/倒序/随机".into(), theme.info),
+                    (keys.play.clone(), "连播".into(), theme.success),
+                    (keys.confirm.clone(), "打开".into(), theme.success),
+                    (keys.back.clone(), "返回".into(), theme.info),
+                ],
+            ))
+            .alignment(Alignment::Center),
             chunks[3],
         );
     }

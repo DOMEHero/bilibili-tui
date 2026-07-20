@@ -474,6 +474,8 @@ pub struct AppConfig {
     pub danmaku: DanmakuConfig,
     #[serde(default = "default_true")]
     pub auto_play: bool,
+    #[serde(default)]
+    pub video_quality: VideoQuality,
 }
 
 impl Default for AppConfig {
@@ -483,6 +485,79 @@ impl Default for AppConfig {
             keybindings: Keybindings::default(),
             danmaku: DanmakuConfig::default(),
             auto_play: true,
+            video_quality: VideoQuality::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoQuality {
+    #[default]
+    Best,
+    Q4k,
+    Q1080pHigh,
+    Q1080p,
+    Q720p,
+    Q480p,
+    Q360p,
+}
+
+impl VideoQuality {
+    pub const ALL: [Self; 7] = [
+        Self::Best,
+        Self::Q4k,
+        Self::Q1080pHigh,
+        Self::Q1080p,
+        Self::Q720p,
+        Self::Q480p,
+        Self::Q360p,
+    ];
+
+    pub const fn qn(self) -> i64 {
+        match self {
+            Self::Best => 127,
+            Self::Q4k => 120,
+            Self::Q1080pHigh => 116,
+            Self::Q1080p => 80,
+            Self::Q720p => 64,
+            Self::Q480p => 32,
+            Self::Q360p => 16,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Best => "最佳",
+            Self::Q4k => "4K",
+            Self::Q1080pHigh => "1080P+/60",
+            Self::Q1080p => "1080P",
+            Self::Q720p => "720P",
+            Self::Q480p => "480P",
+            Self::Q360p => "360P",
+        }
+    }
+
+    pub fn cycle(self, direction: i32) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|quality| *quality == self)
+            .unwrap_or(0);
+        if direction >= 0 {
+            Self::ALL[(index + 1) % Self::ALL.len()]
+        } else {
+            Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+        }
+    }
+
+    pub const fn max_height(self) -> Option<u16> {
+        match self {
+            Self::Best => None,
+            Self::Q4k => Some(2160),
+            Self::Q1080pHigh | Self::Q1080p => Some(1080),
+            Self::Q720p => Some(720),
+            Self::Q480p => Some(480),
+            Self::Q360p => Some(360),
         }
     }
 }
@@ -606,6 +681,19 @@ mod config_tests {
         });
         let config: AppConfig = serde_json::from_value(value).expect("legacy config");
         assert_eq!(config.danmaku, DanmakuConfig::default());
+        assert_eq!(config.video_quality, VideoQuality::Best);
+    }
+
+    #[test]
+    fn video_quality_has_stable_qn_mapping_and_round_trips() {
+        assert_eq!(VideoQuality::Q4k.qn(), 120);
+        assert_eq!(VideoQuality::Q1080pHigh.qn(), 116);
+        let value = serde_json::to_value(VideoQuality::Q720p).unwrap();
+        assert_eq!(value, "q720p");
+        assert_eq!(
+            serde_json::from_value::<VideoQuality>(value).unwrap(),
+            VideoQuality::Q720p
+        );
     }
 
     #[test]

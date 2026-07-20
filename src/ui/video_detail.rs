@@ -1,7 +1,7 @@
 //! Video detail page showing video info, comments, and related videos
 
 use super::video_card::{VideoCard, VideoCardGrid};
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::comment::CommentItem;
 use crate::api::video::{RelatedVideoItem, VideoInfo};
@@ -728,24 +728,33 @@ impl Component for VideoDetailPage {
         } else {
             chunks[2]
         };
-        let help_text = if self.input_mode {
-            format!("[{}] 发送评论  [{}] 取消", keys.confirm, keys.back)
+        let help = if self.input_mode {
+            shortcut_footer(
+                theme,
+                [
+                    (keys.confirm.clone(), "发送评论".into(), theme.success),
+                    (keys.back.clone(), "取消".into(), theme.info),
+                ],
+            )
         } else {
-            format!(
-                "[{}/{}] 滚动  [{}] 切换  [{}] 点赞/选择  [{}] 评论  [{}] 回复  [{}] 播放  [{}] 返回",
-                keys.nav_up,
-                keys.nav_down,
-                keys.nav_next_page,
-                keys.confirm,
-                keys.comment,
-                keys.toggle_replies,
-                keys.play,
-                keys.back
+            shortcut_footer(
+                theme,
+                [
+                    (
+                        format!("{}/{}", keys.nav_up, keys.nav_down),
+                        "滚动".into(),
+                        theme.fg_accent,
+                    ),
+                    (keys.nav_next_page.clone(), "切换".into(), theme.info),
+                    (keys.confirm.clone(), "点赞/选择".into(), theme.success),
+                    (keys.comment.clone(), "评论".into(), theme.info),
+                    (keys.toggle_replies.clone(), "回复".into(), theme.info),
+                    (keys.play.clone(), "播放".into(), theme.success),
+                    (keys.back.clone(), "返回".into(), theme.info),
+                ],
             )
         };
-        let help = Paragraph::new(help_text)
-            .style(Style::default().fg(theme.fg_secondary))
-            .alignment(Alignment::Center);
+        let help = Paragraph::new(help).alignment(Alignment::Center);
         frame.render_widget(help, help_chunk);
     }
 

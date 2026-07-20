@@ -1,6 +1,6 @@
 //! Live streaming detail page with room info and real-time messages
 
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::live::LiveRoomInfo;
 use crate::api::live_danmaku_hub::LiveDanmakuHub;
@@ -344,21 +344,21 @@ impl LiveDetailPage {
         self.render_entry_panel(frame, right_chunks[1], theme);
 
         // Bottom hints
-        let hints = Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {}/", &keys.confirm),
-                Style::default().fg(theme.fg_accent),
-            ),
-            Span::styled(
-                format!("{} ", &keys.play),
-                Style::default().fg(theme.fg_accent),
-            ),
-            Span::styled("播放  ", Style::default().fg(theme.fg_secondary)),
-            Span::styled(&keys.back, Style::default().fg(theme.error)),
-            Span::styled("/", Style::default().fg(theme.fg_secondary)),
-            Span::styled(&keys.quit, Style::default().fg(theme.error)),
-            Span::styled(" 返回", Style::default().fg(theme.fg_secondary)),
-        ]))
+        let hints = Paragraph::new(shortcut_footer(
+            theme,
+            [
+                (
+                    format!("{}/{}", keys.confirm, keys.play),
+                    "播放".into(),
+                    theme.success,
+                ),
+                (
+                    format!("{}/{}", keys.back, keys.quit),
+                    "返回".into(),
+                    theme.info,
+                ),
+            ],
+        ))
         .alignment(Alignment::Center);
         frame.render_widget(hints, chunks[1]);
     }

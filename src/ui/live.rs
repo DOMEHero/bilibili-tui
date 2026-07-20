@@ -1,6 +1,6 @@
 //! Live streaming recommendations page with grid layout
 
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::live::LiveRoom;
 use crate::application::AppAction;
@@ -383,65 +383,28 @@ impl Component for LivePage {
         self.render_grid(frame, chunks[1], theme);
 
         // Footer with hints
-        let nav_keys = keys.get_nav_keys_display();
-        let hints = Paragraph::new(Line::from(vec![
-            Span::styled(" [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                format!("{}/↑↓←→", nav_keys),
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("导航", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                format!("{}/{}", keys.page_up, keys.page_down),
-                Style::default()
-                    .fg(theme.fg_accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("翻页", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &keys.confirm,
-                Style::default()
-                    .fg(theme.success)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("/", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &keys.play,
-                Style::default()
-                    .fg(theme.success)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("进入", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &keys.refresh,
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("刷新", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &keys.next_theme,
-                Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("切换主题", Style::default().fg(theme.fg_secondary)),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border_subtle)),
-        )
+        let hints = Paragraph::new(shortcut_footer(
+            theme,
+            [
+                (
+                    format!("{}/↑↓←→", keys.get_nav_keys_display()),
+                    "导航".into(),
+                    theme.fg_accent,
+                ),
+                (
+                    format!("{}/{}", keys.page_up, keys.page_down),
+                    "翻页".into(),
+                    theme.fg_accent,
+                ),
+                (
+                    format!("{}/{}", keys.confirm, keys.play),
+                    "进入".into(),
+                    theme.success,
+                ),
+                (keys.refresh.clone(), "刷新".into(), theme.info),
+                (keys.next_theme.clone(), "切换主题".into(), theme.info),
+            ],
+        ))
         .alignment(Alignment::Center);
         frame.render_widget(hints, chunks[2]);
     }
