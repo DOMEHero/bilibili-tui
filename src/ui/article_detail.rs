@@ -1,6 +1,6 @@
 //! Full-page article reader used by history entries.
 
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::{
     article::{ArticleBlock, ArticleData},
     comment::CommentItem,
@@ -21,6 +21,12 @@ use tokio::sync::mpsc;
 struct ImageResult {
     index: usize,
     protocol: Option<StatefulProtocol>,
+}
+
+struct ArticleImageState<'a> {
+    urls: &'a [String],
+    protocols: &'a mut [Option<StatefulProtocol>],
+    failed: &'a HashSet<usize>,
 }
 
 pub struct ArticleDetailPage {
@@ -129,8 +135,8 @@ impl ArticleDetailPage {
         frame.render_widget(block, area);
         self.visible_height = inner.height.max(1);
 
-        let blocks = self.blocks.clone();
-        let heights = blocks
+        let heights = self
+            .blocks
             .iter()
             .map(|block| article_block_height(block, inner.width))
             .collect::<Vec<_>>();
@@ -142,7 +148,7 @@ impl ArticleDetailPage {
         let viewport_start = self.scroll;
         let viewport_end = viewport_start.saturating_add(self.visible_height);
         let mut document_y = 0u16;
-        for (article_block, block_height) in blocks.iter().zip(heights) {
+        for (article_block, block_height) in self.blocks.iter().zip(heights) {
             let block_end = document_y.saturating_add(block_height);
             if block_end <= viewport_start {
                 document_y = block_end;
@@ -187,7 +193,12 @@ impl ArticleDetailPage {
                     );
                 }
                 ArticleBlock::Image { url, alt } => {
-                    self.render_inline_image(frame, render_area, url, alt, theme);
+                    let mut images = ArticleImageState {
+                        urls: &self.image_urls,
+                        protocols: &mut self.image_protocols,
+                        failed: &self.failed_images,
+                    };
+                    Self::render_inline_image(frame, render_area, url, alt, theme, &mut images);
                 }
             }
             document_y = block_end;
@@ -195,12 +206,12 @@ impl ArticleDetailPage {
     }
 
     fn render_inline_image(
-        &mut self,
         frame: &mut Frame,
         area: Rect,
         url: &str,
         alt: &str,
         theme: &Theme,
+        images: &mut ArticleImageState<'_>,
     ) {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -209,17 +220,13 @@ impl ArticleDetailPage {
             .title(format!(" {alt} "));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let Some(index) = self
-            .image_urls
-            .iter()
-            .position(|candidate| candidate == url)
-        else {
+        let Some(index) = images.urls.iter().position(|candidate| candidate == url) else {
             return;
         };
-        if let Some(Some(protocol)) = self.image_protocols.get_mut(index) {
+        if let Some(Some(protocol)) = images.protocols.get_mut(index) {
             frame.render_stateful_widget(StatefulImage::default(), inner, protocol);
         } else {
-            let message = if self.failed_images.contains(&index) {
+            let message = if images.failed.contains(&index) {
                 "图片加载失败"
             } else {
                 "图片加载中..."
@@ -339,25 +346,27 @@ impl Component for ArticleDetailPage {
             self.render_comments(frame, content[1], theme);
         }
 
-        let muted = Style::default().fg(theme.fg_secondary);
-        let accent = Style::default()
-            .fg(theme.fg_accent)
-            .add_modifier(Modifier::BOLD);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" [", muted),
-                Span::styled(keys.get_arrow_keys_display(), accent),
-                Span::styled("/", muted),
-                Span::styled(keys.get_nav_keys_display(), accent),
-                Span::styled("] 滚动  [", muted),
-                Span::styled(format!("{}/{}", keys.page_up, keys.page_down), accent),
-                Span::styled("] 翻页  [", muted),
-                Span::styled(
-                    &keys.back,
-                    Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("] 返回", muted),
-            ]))
+            Paragraph::new(shortcut_footer(
+                theme,
+                [
+                    (
+                        format!(
+                            "{}/{}",
+                            keys.get_arrow_keys_display(),
+                            keys.get_nav_keys_display()
+                        ),
+                        "滚动".into(),
+                        theme.fg_accent,
+                    ),
+                    (
+                        format!("{}/{}", keys.page_up, keys.page_down),
+                        "翻页".into(),
+                        theme.fg_accent,
+                    ),
+                    (keys.back.clone(), "返回".into(), theme.info),
+                ],
+            ))
             .alignment(Alignment::Center),
             chunks[2],
         );

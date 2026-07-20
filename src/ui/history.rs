@@ -175,6 +175,16 @@ impl HistoryPage {
         self.loading = false;
     }
 
+    /// Leave the in-flight deletion state when the request cannot be started,
+    /// such as when credentials expire between confirmation and dispatch.
+    pub fn cancel_deletion(&mut self) {
+        self.mode = if self.selected_keys.is_empty() {
+            HistoryMode::Browse
+        } else {
+            HistoryMode::Selecting
+        };
+    }
+
     pub async fn load_more(&mut self, api_client: &ApiClient) {
         if self.loading || !self.has_more {
             return;
@@ -1045,5 +1055,20 @@ mod tests {
         page.handle_input_with_modifiers(KeyCode::Esc, KeyModifiers::NONE, &keys);
         assert!(page.selected_keys.is_empty());
         assert_eq!(page.mode, HistoryMode::Browse);
+    }
+
+    #[test]
+    fn cancel_deletion_restores_selection_mode() {
+        let mut page = history_page();
+        page.selected_keys.insert(HistoryKey {
+            business: "archive".into(),
+            kid: 1,
+        });
+        page.mode = HistoryMode::Deleting;
+
+        page.cancel_deletion();
+
+        assert_eq!(page.mode, HistoryMode::Selecting);
+        assert_eq!(page.selected_keys.len(), 1);
     }
 }

@@ -623,6 +623,9 @@ impl App {
             AppAction::DeleteHistoryItems(keys) => {
                 if self.credentials.is_none() {
                     self.apply_login_required_hint();
+                    if let Page::History(page) = &mut self.current_page {
+                        page.cancel_deletion();
+                    }
                     return;
                 }
                 if keys.is_empty() {
