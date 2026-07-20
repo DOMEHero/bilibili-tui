@@ -24,9 +24,9 @@ repos:
     rev: v1.2.1
     hooks:
       - id: build
-        stages: [push]
+        stages: [pre-push]
         name: Cargo Build
 
       - id: test
-        stages: [push]
+        stages: [pre-push]
         name: Cargo Test
