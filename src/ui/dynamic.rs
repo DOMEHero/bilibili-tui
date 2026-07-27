@@ -1,7 +1,7 @@
 //! Dynamic feed page with video card grid display
 
 use super::video_card::{VideoCard, VideoCardGrid};
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::dynamic::DynamicItem;
 use crate::application::AppAction;
@@ -484,11 +484,21 @@ impl Component for DynamicPage {
         }
 
         frame.render_widget(
-            Paragraph::new(format!(
-                "[↑/↓] 选择动态  [{}/{}] 翻页  [←/→] 切换面板  [{}] 切标签  [{}] 详情  [{}] 刷新",
-                keys.page_up, keys.page_down, keys.tab_1, keys.confirm, keys.refresh
+            Paragraph::new(shortcut_footer(
+                theme,
+                [
+                    ("↑/↓".into(), "选择动态".into(), theme.fg_accent),
+                    (
+                        format!("{}/{}", keys.page_up, keys.page_down),
+                        "翻页".into(),
+                        theme.fg_accent,
+                    ),
+                    ("←/→".into(), "切换面板".into(), theme.fg_accent),
+                    (keys.tab_1.clone(), "切标签".into(), theme.info),
+                    (keys.confirm.clone(), "详情".into(), theme.success),
+                    (keys.refresh.clone(), "刷新".into(), theme.info),
+                ],
             ))
-            .style(Style::default().fg(theme.fg_secondary))
             .alignment(Alignment::Center),
             chunks[2],
         );

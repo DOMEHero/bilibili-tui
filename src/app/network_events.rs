@@ -137,6 +137,33 @@ impl App {
                     }
                 }
             }
+            network::NetworkEvent::HistoryDeleted {
+                req_id,
+                successful,
+                failed,
+            } => {
+                if !self.is_latest_request("history_delete", req_id) {
+                    return;
+                }
+                if let Page::History(page) = &mut self.current_page {
+                    page.apply_delete_result(successful, failed);
+                }
+            }
+            network::NetworkEvent::ArticleLoaded {
+                req_id,
+                cvid,
+                article,
+                comments,
+            } => {
+                if !self.is_latest_request("article_detail", req_id) {
+                    return;
+                }
+                if let Page::ArticleDetail(page) = &mut self.current_page
+                    && page.cvid == cvid
+                {
+                    page.set_article(article, comments);
+                }
+            }
             network::NetworkEvent::LiveLoaded {
                 req_id,
                 append,
@@ -444,6 +471,9 @@ impl App {
                     (Page::DynamicDetail(page), "dynamic_detail") => {
                         page.error_message = Some(format!("加载动态详情失败: {}", error));
                         page.loading = false;
+                    }
+                    (Page::ArticleDetail(page), "article_detail") => {
+                        page.set_error(format!("加载专栏失败: {error}"));
                     }
                     (Page::Bangumi(page), "bangumi_timeline") => {
                         page.set_error(format!("加载番剧时间表失败: {}", error));

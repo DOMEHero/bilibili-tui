@@ -72,6 +72,7 @@ impl App {
             Page::Login(_)
                 | Page::VideoDetail(_)
                 | Page::DynamicDetail(_)
+                | Page::ArticleDetail(_)
                 | Page::BangumiDetail(_)
                 | Page::Up(_)
         ) {
@@ -101,6 +102,7 @@ impl App {
             Page::Login(_)
                 | Page::VideoDetail(_)
                 | Page::DynamicDetail(_)
+                | Page::ArticleDetail(_)
                 | Page::BangumiDetail(_)
                 | Page::Up(_)
         ) {
@@ -108,6 +110,7 @@ impl App {
                 Page::Login(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::VideoDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::DynamicDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
+                Page::ArticleDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::BangumiDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 Page::Up(page) => page.draw(frame, area, &self.theme, &self.keybindings),
                 _ => {}
@@ -169,6 +172,7 @@ impl App {
             Page::Search(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::Dynamic(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::DynamicDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
+            Page::ArticleDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::VideoDetail(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::History(page) => page.draw(frame, area, &self.theme, &self.keybindings),
             Page::Favorites(page) => page.draw(frame, area, &self.theme, &self.keybindings),
@@ -192,8 +196,9 @@ impl App {
             Page::Search(page) => page.handle_input(key, keys),
             Page::Dynamic(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::DynamicDetail(page) => page.handle_input(key, keys),
+            Page::ArticleDetail(page) => page.handle_input(key, keys),
             Page::VideoDetail(page) => page.handle_input(key, keys),
-            Page::History(page) => page.handle_input(key, keys),
+            Page::History(page) => page.handle_input_with_modifiers(key, modifiers, keys),
             Page::Favorites(page) => page.handle_input(key, keys),
             Page::Live(page) => page.handle_input(key, keys),
             Page::LiveDetail(page) => page.handle_input(key, keys),
@@ -215,6 +220,7 @@ impl App {
             Page::Search(page) => page.handle_mouse(event, area),
             Page::Dynamic(page) => page.handle_mouse(event, area),
             Page::DynamicDetail(page) => page.handle_mouse(event, area),
+            Page::ArticleDetail(page) => page.handle_mouse(event, area),
             Page::VideoDetail(page) => page.handle_mouse(event, area),
             Page::History(page) => page.handle_mouse(event, area),
             Page::Favorites(page) => page.handle_mouse(event, area),
@@ -273,15 +279,20 @@ impl App {
         }
 
         let auto_play = if self.config.auto_play {
-            if let Page::VideoDetail(page) = &mut self.current_page {
-                if page.auto_play_pending && !page.loading && page.video_info.is_some() {
+            match &mut self.current_page {
+                Page::VideoDetail(page)
+                    if page.auto_play_pending && !page.loading && page.video_info.is_some() =>
+                {
                     page.auto_play_pending = false;
-                    Some((page.bvid.clone(), page.play_action()))
-                } else {
-                    None
+                    Some((Some(page.bvid.clone()), page.play_action()))
                 }
-            } else {
-                None
+                Page::BangumiDetail(page)
+                    if page.auto_play_pending && !page.loading && page.season.is_some() =>
+                {
+                    page.auto_play_pending = false;
+                    page.play_action().map(|action| (None, action))
+                }
+                _ => None,
             }
         } else {
             // Auto-play disabled: clear the pending flag so it doesn't fire
@@ -289,11 +300,14 @@ impl App {
             if let Page::VideoDetail(page) = &mut self.current_page {
                 page.auto_play_pending = false;
             }
+            if let Page::BangumiDetail(page) = &mut self.current_page {
+                page.auto_play_pending = false;
+            }
             None
         };
-        if let Some((bvid, action)) = auto_play {
+        if let Some((return_bvid, action)) = auto_play {
             self.handle_action(action).await;
-            if let Some(session_id) = self.playback.session_id {
+            if let (Some(bvid), Some(session_id)) = (return_bvid, self.playback.session_id) {
                 self.auto_return_after_playback = Some((session_id, bvid));
             }
         }
@@ -320,6 +334,10 @@ impl App {
             Page::VideoDetail(page) => {
                 page.poll_cover_results();
                 page.start_cover_downloads();
+            }
+            Page::ArticleDetail(page) => {
+                page.poll_image_results();
+                page.start_image_downloads();
             }
             Page::History(page) => {
                 page.poll_cover_results();

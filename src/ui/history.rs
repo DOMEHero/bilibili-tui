@@ -2,12 +2,12 @@
 
 use super::{Component, Theme};
 use crate::api::client::ApiClient;
-use crate::api::history::{HistoryCursor, HistoryItem};
+use crate::api::history::{HistoryCursor, HistoryItem, HistoryKey};
 use crate::application::AppAction;
 use crate::storage::Keybindings;
 use image::DynamicImage;
 use ratatui::{
-    crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind},
+    crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     prelude::*,
     widgets::*,
 };
@@ -26,7 +26,16 @@ struct HistoryCard {
 /// Message for completed cover download
 struct CoverResult {
     index: usize,
+    generation: u64,
     protocol: StatefulProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryMode {
+    Browse,
+    Selecting,
+    ConfirmDelete,
+    Deleting,
 }
 
 pub struct HistoryPage {
@@ -43,6 +52,10 @@ pub struct HistoryPage {
     cover_rx: mpsc::Receiver<CoverResult>,
     cover_tx: mpsc::Sender<CoverResult>,
     cached_visible_rows: usize,
+    selected_keys: HashSet<HistoryKey>,
+    mode: HistoryMode,
+    notice: Option<String>,
+    generation: u64,
 
     last_click_time: Option<Instant>,
     last_click_index: Option<usize>,
@@ -71,6 +84,10 @@ impl HistoryPage {
             cover_rx: rx,
             cover_tx: tx,
             cached_visible_rows: Self::INITIAL_VISIBLE_ROWS,
+            selected_keys: HashSet::new(),
+            mode: HistoryMode::Browse,
+            notice: None,
+            generation: 0,
             last_click_time: None,
             last_click_index: None,
         }
@@ -93,6 +110,7 @@ impl HistoryPage {
                 self.cursor = Some(data.cursor);
                 self.has_more = !self.items.is_empty();
                 self.loading = false;
+                self.reset_selection_and_downloads();
             }
             Err(e) => {
                 self.error = Some(format!("加载历史记录失败: {}", e));
@@ -121,6 +139,7 @@ impl HistoryPage {
         self.scroll_offset = 0;
         self.loading = false;
         self.error = None;
+        self.reset_selection_and_downloads();
     }
 
     pub fn start_load_more_request(&mut self) -> Option<crate::api::history::HistoryCursor> {
@@ -154,6 +173,16 @@ impl HistoryPage {
     pub fn apply_load_more_error(&mut self, msg: String) {
         self.error = Some(msg);
         self.loading = false;
+    }
+
+    /// Leave the in-flight deletion state when the request cannot be started,
+    /// such as when credentials expire between confirmation and dispatch.
+    pub fn cancel_deletion(&mut self) {
+        self.mode = if self.selected_keys.is_empty() {
+            HistoryMode::Browse
+        } else {
+            HistoryMode::Selecting
+        };
     }
 
     pub async fn load_more(&mut self, api_client: &ApiClient) {
@@ -233,6 +262,7 @@ impl HistoryPage {
             let url = cover_url.to_string();
             let tx = self.cover_tx.clone();
             let picker = Arc::clone(&self.picker);
+            let generation = self.generation;
 
             tokio::spawn(async move {
                 if let Some(img) = Self::download_image(&url).await {
@@ -240,6 +270,7 @@ impl HistoryPage {
                     let _ = tx
                         .send(CoverResult {
                             index: idx,
+                            generation,
                             protocol,
                         })
                         .await;
@@ -251,6 +282,9 @@ impl HistoryPage {
     /// Poll for completed cover downloads (non-blocking)
     pub fn poll_cover_results(&mut self) {
         while let Ok(result) = self.cover_rx.try_recv() {
+            if result.generation != self.generation {
+                continue;
+            }
             self.pending_downloads.remove(&result.index);
             if result.index < self.items.len() {
                 self.items[result.index].cover_protocol = Some(result.protocol);
@@ -303,7 +337,7 @@ impl HistoryPage {
     }
 
     fn action_for_history_item(item: &HistoryItem) -> Option<AppAction> {
-        if item.is_video() {
+        if item.history.business == "archive" {
             if let Some(bvid) = item.get_bvid() {
                 let aid = item.history.oid;
                 return Some(AppAction::OpenVideoDetail(bvid.to_string(), aid));
@@ -311,11 +345,123 @@ impl HistoryPage {
             return None;
         }
 
+        if item.history.business == "pgc" {
+            return (item.kid > 0 && item.history.epid > 0).then_some(
+                AppAction::OpenHistoryBangumi {
+                    season_id: item.kid,
+                    ep_id: item.history.epid,
+                },
+            );
+        }
+
+        if let Some(cvid) = item.article_id() {
+            return Some(AppAction::OpenArticle(cvid));
+        }
+
         if item.is_live() && item.live_status == 1 {
             return item.get_live_room_id().map(AppAction::OpenLiveDetail);
         }
 
         None
+    }
+
+    fn reset_selection_and_downloads(&mut self) {
+        self.selected_keys.clear();
+        self.mode = HistoryMode::Browse;
+        self.notice = None;
+        self.pending_downloads.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn toggle_selected(&mut self) {
+        let Some(key) = self
+            .items
+            .get(self.selected)
+            .and_then(|card| card.item.history_key())
+        else {
+            self.notice = Some("直播记录不支持批量选择".to_string());
+            return;
+        };
+        let newly_selected = if self.selected_keys.remove(&key) {
+            false
+        } else {
+            self.selected_keys.insert(key);
+            true
+        };
+        self.mode = if self.selected_keys.is_empty() {
+            HistoryMode::Browse
+        } else {
+            HistoryMode::Selecting
+        };
+        self.notice = None;
+        if newly_selected && self.selected + 1 < self.items.len() {
+            self.selected += 1;
+            self.update_scroll(self.cached_visible_rows.max(1));
+        }
+    }
+
+    fn select_all_loaded(&mut self) {
+        self.selected_keys = self
+            .items
+            .iter()
+            .filter_map(|card| card.item.history_key())
+            .collect();
+        self.mode = if self.selected_keys.is_empty() {
+            HistoryMode::Browse
+        } else {
+            HistoryMode::Selecting
+        };
+        self.notice = None;
+    }
+
+    fn invert_loaded_selection(&mut self) {
+        let eligible: HashSet<_> = self
+            .items
+            .iter()
+            .filter_map(|card| card.item.history_key())
+            .collect();
+        self.selected_keys = eligible.difference(&self.selected_keys).cloned().collect();
+        self.mode = if self.selected_keys.is_empty() {
+            HistoryMode::Browse
+        } else {
+            HistoryMode::Selecting
+        };
+        self.notice = None;
+    }
+
+    pub fn apply_delete_result(
+        &mut self,
+        successful: Vec<HistoryKey>,
+        failed: Vec<(HistoryKey, String)>,
+    ) {
+        let successful: HashSet<_> = successful.into_iter().collect();
+        let success_count = successful.len();
+        self.items.retain(|card| {
+            card.item
+                .history_key()
+                .is_none_or(|key| !successful.contains(&key))
+        });
+        self.pending_downloads.clear();
+        self.generation = self.generation.wrapping_add(1);
+        for card in &mut self.items {
+            card.cover_protocol = None;
+        }
+
+        self.selected_keys = failed.iter().map(|(key, _)| key.clone()).collect();
+        let failed_count = failed.len();
+        self.mode = if failed_count == 0 {
+            HistoryMode::Browse
+        } else {
+            HistoryMode::Selecting
+        };
+        self.selected = self.selected.min(self.items.len().saturating_sub(1));
+        let total_rows = self.items.len().div_ceil(Self::COLUMNS);
+        self.scroll_offset = self.scroll_offset.min(total_rows.saturating_sub(1));
+        self.notice = Some(if failed_count == 0 {
+            format!("已删除 {success_count} 条历史记录")
+        } else {
+            format!("已删除 {success_count} 条，{failed_count} 条失败并保留选择")
+        });
     }
 }
 
@@ -326,7 +472,7 @@ impl Default for HistoryPage {
 }
 
 impl Component for HistoryPage {
-    fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, _keys: &Keybindings) {
+    fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
         // Main block
         let block = Block::default()
             .borders(Borders::ALL)
@@ -370,8 +516,12 @@ impl Component for HistoryPage {
             return;
         }
 
-        // Render grid
-        self.render_grid(frame, inner, theme);
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+        self.render_grid(frame, chunks[0], theme);
+        self.render_footer(frame, chunks[1], theme, keys);
+        if self.mode == HistoryMode::ConfirmDelete {
+            self.render_delete_confirmation(frame, area, theme);
+        }
     }
 
     fn handle_input(
@@ -379,11 +529,75 @@ impl Component for HistoryPage {
         key: KeyCode,
         keys: &crate::storage::Keybindings,
     ) -> Option<AppAction> {
+        self.handle_input_with_modifiers(key, KeyModifiers::NONE, keys)
+    }
+
+    fn handle_input_with_modifiers(
+        &mut self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+        keys: &crate::storage::Keybindings,
+    ) -> Option<AppAction> {
+        if self.mode == HistoryMode::Deleting {
+            return None;
+        }
+        if self.mode == HistoryMode::ConfirmDelete {
+            if key == KeyCode::Esc || keys.matches_back(key) {
+                self.mode = HistoryMode::Selecting;
+                return None;
+            }
+            if keys.matches_confirm(key) {
+                self.mode = HistoryMode::Deleting;
+                return Some(AppAction::DeleteHistoryItems(
+                    self.selected_keys.iter().cloned().collect(),
+                ));
+            }
+            return None;
+        }
+
+        if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('a') {
+            self.select_all_loaded();
+            return None;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('r') {
+            self.invert_loaded_selection();
+            return None;
+        }
+        if key == KeyCode::Char(' ') {
+            self.toggle_selected();
+            return None;
+        }
+        if key == KeyCode::Char('d') {
+            if self.selected_keys.is_empty() {
+                let Some(key) = self
+                    .items
+                    .get(self.selected)
+                    .and_then(|card| card.item.history_key())
+                else {
+                    self.notice = Some("该记录不支持删除".to_string());
+                    return None;
+                };
+                self.selected_keys.insert(key);
+            }
+            self.notice = None;
+            self.mode = HistoryMode::ConfirmDelete;
+            return None;
+        }
+        if key == KeyCode::Esc || keys.matches_back(key) {
+            if !self.selected_keys.is_empty() {
+                self.selected_keys.clear();
+                self.mode = HistoryMode::Browse;
+                self.notice = None;
+                return None;
+            }
+            return Some(AppAction::BackToList);
+        }
+
         let cols = Self::COLUMNS;
         let total = self.items.len();
 
-        if keys.matches_quit(key) || keys.matches_back(key) {
-            return Some(AppAction::BackToList);
+        if keys.matches_quit(key) {
+            return Some(AppAction::Quit);
         }
         if keys.matches_left(key) {
             if self.selected > 0 {
@@ -430,6 +644,9 @@ impl Component for HistoryPage {
             return Some(AppAction::OpenUpPage(item.item.author_mid));
         }
         if keys.matches_confirm(key) {
+            if !self.selected_keys.is_empty() {
+                return None;
+            }
             if let Some(card) = self.items.get(self.selected) {
                 return Self::action_for_history_item(&card.item);
             }
@@ -448,6 +665,12 @@ impl Component for HistoryPage {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<AppAction> {
+        if matches!(
+            self.mode,
+            HistoryMode::ConfirmDelete | HistoryMode::Deleting
+        ) {
+            return None;
+        }
         let cols = Self::COLUMNS;
         let total = self.items.len();
 
@@ -539,8 +762,12 @@ impl HistoryPage {
 
             let card_area = Rect::new(x, y, card_width, card_height);
             let is_selected = idx == self.selected;
+            let is_marked = self.items[idx]
+                .item
+                .history_key()
+                .is_some_and(|key| self.selected_keys.contains(&key));
 
-            self.render_history_card(frame, card_area, idx, is_selected, theme);
+            self.render_history_card(frame, card_area, idx, is_selected, is_marked, theme);
         }
 
         // Loading indicator at bottom
@@ -559,18 +786,21 @@ impl HistoryPage {
         area: Rect,
         idx: usize,
         is_selected: bool,
+        is_marked: bool,
         theme: &Theme,
     ) {
         let card = &mut self.items[idx];
 
         // Card border
-        let border_color = if is_selected {
+        let border_color = if is_marked {
+            theme.warning
+        } else if is_selected {
             theme.bilibili_pink
         } else {
             theme.border_subtle
         };
 
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_type(if is_selected {
                 BorderType::Thick
@@ -578,6 +808,14 @@ impl HistoryPage {
                 BorderType::Rounded
             })
             .border_style(Style::default().fg(border_color));
+        if is_marked {
+            block = block.title(Span::styled(
+                " ✓ 已选择 ",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -650,5 +888,187 @@ impl HistoryPage {
                 Paragraph::new(progress_text).style(Style::default().fg(theme.fg_secondary));
             frame.render_widget(progress_widget, info_chunks[2]);
         }
+    }
+
+    fn render_footer(&self, frame: &mut Frame, area: Rect, theme: &Theme, keys: &Keybindings) {
+        if self.mode == HistoryMode::Deleting || self.notice.is_some() {
+            let text = self.notice.as_deref().unwrap_or("正在删除所选历史记录...");
+            frame.render_widget(
+                Paragraph::new(text)
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(theme.fg_secondary)),
+                area,
+            );
+            return;
+        }
+
+        let muted = Style::default().fg(theme.fg_secondary);
+        let accent = Style::default()
+            .fg(theme.fg_accent)
+            .add_modifier(Modifier::BOLD);
+        let help = Line::from(vec![
+            Span::styled(" [", muted),
+            Span::styled(keys.get_arrow_keys_display(), accent),
+            Span::styled("/", muted),
+            Span::styled(keys.get_nav_keys_display(), accent),
+            Span::styled("] 导航  [", muted),
+            Span::styled("Space", accent),
+            Span::styled("] 选择  [", muted),
+            Span::styled("Ctrl+A/Ctrl+R", accent),
+            Span::styled("] 全选/反选  [", muted),
+            Span::styled(
+                "d",
+                Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("] 删除  [", muted),
+            Span::styled(
+                &keys.confirm,
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("] 详情  [", muted),
+            Span::styled("Esc", accent),
+            Span::styled(format!("] 取消  已选 {}", self.selected_keys.len()), muted),
+        ]);
+        frame.render_widget(Paragraph::new(help).alignment(Alignment::Center), area);
+    }
+
+    fn render_delete_confirmation(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let width = area.width.min(52);
+        let height = area.height.min(7);
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let message = format!(
+            "确定删除 {} 条历史记录？\n\nEnter 确认 · Esc 返回选择",
+            self.selected_keys.len()
+        );
+        frame.render_widget(
+            Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme.fg_primary))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme.warning))
+                        .title(" 删除历史记录 "),
+                ),
+            popup,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn history_page() -> HistoryPage {
+        let data = serde_json::from_value(serde_json::json!({
+            "cursor": {"max": 0, "view_at": 0, "business": "", "ps": 20},
+            "tab": null,
+            "list": [
+                {"title": "video", "kid": 1, "history": {"oid": 1, "bvid": "BV1", "business": "archive"}},
+                {"title": "article", "kid": 2, "history": {"oid": 20, "business": "article"}},
+                {"title": "live", "kid": 3, "history": {"oid": 30, "business": "live"}}
+            ]
+        }))
+        .expect("history fixture");
+        let mut page = HistoryPage::new();
+        page.apply_history_init(data);
+        page
+    }
+
+    #[test]
+    fn selection_shortcuts_only_include_loaded_eligible_records() {
+        let keys = Keybindings::default();
+        let mut page = history_page();
+
+        page.handle_input_with_modifiers(KeyCode::Char(' '), KeyModifiers::NONE, &keys);
+        assert_eq!(page.selected, 1);
+        assert_eq!(page.selected_keys.len(), 1);
+        page.handle_input_with_modifiers(KeyCode::Esc, KeyModifiers::NONE, &keys);
+
+        page.handle_input_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL, &keys);
+        assert_eq!(page.selected_keys.len(), 2);
+        page.handle_input_with_modifiers(KeyCode::Char('r'), KeyModifiers::CONTROL, &keys);
+        assert!(page.selected_keys.is_empty());
+
+        page.selected = 2;
+        page.handle_input_with_modifiers(KeyCode::Char(' '), KeyModifiers::NONE, &keys);
+        assert!(page.selected_keys.is_empty());
+    }
+
+    #[test]
+    fn delete_without_selection_targets_the_hovered_record() {
+        let keys = Keybindings::default();
+        let mut page = history_page();
+        page.selected = 1;
+
+        page.handle_input_with_modifiers(KeyCode::Char('d'), KeyModifiers::NONE, &keys);
+
+        assert_eq!(page.mode, HistoryMode::ConfirmDelete);
+        assert_eq!(
+            page.selected_keys,
+            HashSet::from([HistoryKey {
+                business: "article".into(),
+                kid: 2,
+            }])
+        );
+    }
+
+    #[test]
+    fn delete_confirmation_escape_and_partial_result_preserve_failed_selection() {
+        let keys = Keybindings::default();
+        let mut page = history_page();
+        page.handle_input_with_modifiers(KeyCode::Char('a'), KeyModifiers::CONTROL, &keys);
+        page.handle_input_with_modifiers(KeyCode::Char('d'), KeyModifiers::NONE, &keys);
+        assert_eq!(page.mode, HistoryMode::ConfirmDelete);
+
+        page.handle_input_with_modifiers(KeyCode::Esc, KeyModifiers::NONE, &keys);
+        assert_eq!(page.mode, HistoryMode::Selecting);
+        assert_eq!(page.selected_keys.len(), 2);
+
+        page.handle_input_with_modifiers(KeyCode::Char('d'), KeyModifiers::NONE, &keys);
+        let action = page.handle_input_with_modifiers(KeyCode::Enter, KeyModifiers::NONE, &keys);
+        assert!(matches!(action, Some(AppAction::DeleteHistoryItems(_))));
+        assert_eq!(page.mode, HistoryMode::Deleting);
+
+        let video = HistoryKey {
+            business: "archive".into(),
+            kid: 1,
+        };
+        let article = HistoryKey {
+            business: "article".into(),
+            kid: 2,
+        };
+        page.apply_delete_result(vec![video], vec![(article.clone(), "denied".into())]);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.selected_keys.contains(&article));
+        assert_eq!(page.mode, HistoryMode::Selecting);
+
+        page.handle_input_with_modifiers(KeyCode::Esc, KeyModifiers::NONE, &keys);
+        assert!(page.selected_keys.is_empty());
+        assert_eq!(page.mode, HistoryMode::Browse);
+    }
+
+    #[test]
+    fn cancel_deletion_restores_selection_mode() {
+        let mut page = history_page();
+        page.selected_keys.insert(HistoryKey {
+            business: "archive".into(),
+            kid: 1,
+        });
+        page.mode = HistoryMode::Deleting;
+
+        page.cancel_deletion();
+
+        assert_eq!(page.mode, HistoryMode::Selecting);
+        assert_eq!(page.selected_keys.len(), 1);
     }
 }

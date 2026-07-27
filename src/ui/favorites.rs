@@ -1,4 +1,4 @@
-use super::{Component, Theme, VideoCard, VideoCardGrid};
+use super::{Component, Theme, VideoCard, VideoCardGrid, shortcut_footer};
 use crate::api::favorite::{
     CollectedFolder, FavoriteFolder, FavoriteResourceData, FavoriteSource, SeasonArchivesData,
     WatchLaterData,
@@ -8,7 +8,7 @@ use crate::storage::Keybindings;
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind},
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
@@ -317,13 +317,22 @@ impl Component for FavoritesPage {
             self.videos.render(frame, right[1], theme);
         }
         frame.render_widget(
-            Paragraph::new(format!(
-                "[↑/↓] 选择  [{}/{}] 翻页  [←/→] 收藏/视频  [Enter] 打开  [{}] 下一页面  [{}] 上一页面",
-                keys.page_up,
-                keys.page_down,
-                keys.nav_next_page,
-                keys.nav_prev_page
-            )),
+            Paragraph::new(shortcut_footer(
+                theme,
+                [
+                    ("↑/↓".into(), "选择".into(), theme.fg_accent),
+                    (
+                        format!("{}/{}", keys.page_up, keys.page_down),
+                        "翻页".into(),
+                        theme.fg_accent,
+                    ),
+                    ("←/→".into(), "收藏/视频".into(), theme.fg_accent),
+                    (keys.confirm.clone(), "打开".into(), theme.success),
+                    (keys.nav_next_page.clone(), "下一页面".into(), theme.info),
+                    (keys.nav_prev_page.clone(), "上一页面".into(), theme.info),
+                ],
+            ))
+            .alignment(Alignment::Center),
             right[2],
         );
         let _ = sources;
