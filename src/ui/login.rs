@@ -1,6 +1,6 @@
 //! Login page with QR code display
 
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::auth::{QrcodeData, QrcodePollStatus};
 use crate::api::client::ApiClient;
 use crate::application::AppAction;
@@ -270,27 +270,13 @@ impl Component for LoginPage {
             );
         frame.render_widget(status, chunks[2]);
 
-        // Help with styled shortcuts
-        let help_line = Line::from(vec![
-            Span::styled(" [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &keys.refresh,
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("刷新二维码", Style::default().fg(theme.fg_secondary)),
-            Span::styled("  [", Style::default().fg(theme.fg_secondary)),
-            Span::styled(
-                &keys.quit,
-                Style::default()
-                    .fg(theme.error)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] ", Style::default().fg(theme.fg_secondary)),
-            Span::styled("退出", Style::default().fg(theme.fg_secondary)),
-        ]);
+        let help_line = shortcut_footer(
+            theme,
+            [
+                (keys.refresh.clone(), "刷新二维码".into(), theme.warning),
+                (keys.quit.clone(), "退出".into(), theme.error),
+            ],
+        );
         let help = Paragraph::new(help_line).alignment(Alignment::Center);
         frame.render_widget(help, chunks[3]);
     }

@@ -1,6 +1,6 @@
 //! History page with watch history display in a grid layout with cover images
 
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::history::{HistoryCursor, HistoryItem, HistoryKey};
 use crate::application::AppAction;
@@ -178,11 +178,7 @@ impl HistoryPage {
     /// Leave the in-flight deletion state when the request cannot be started,
     /// such as when credentials expire between confirmation and dispatch.
     pub fn cancel_deletion(&mut self) {
-        self.mode = if self.selected_keys.is_empty() {
-            HistoryMode::Browse
-        } else {
-            HistoryMode::Selecting
-        };
+        self.sync_selection_mode();
     }
 
     pub async fn load_more(&mut self, api_client: &ApiClient) {
@@ -373,6 +369,14 @@ impl HistoryPage {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    fn sync_selection_mode(&mut self) {
+        self.mode = if self.selected_keys.is_empty() {
+            HistoryMode::Browse
+        } else {
+            HistoryMode::Selecting
+        };
+    }
+
     fn toggle_selected(&mut self) {
         let Some(key) = self
             .items
@@ -388,11 +392,7 @@ impl HistoryPage {
             self.selected_keys.insert(key);
             true
         };
-        self.mode = if self.selected_keys.is_empty() {
-            HistoryMode::Browse
-        } else {
-            HistoryMode::Selecting
-        };
+        self.sync_selection_mode();
         self.notice = None;
         if newly_selected && self.selected + 1 < self.items.len() {
             self.selected += 1;
@@ -406,11 +406,7 @@ impl HistoryPage {
             .iter()
             .filter_map(|card| card.item.history_key())
             .collect();
-        self.mode = if self.selected_keys.is_empty() {
-            HistoryMode::Browse
-        } else {
-            HistoryMode::Selecting
-        };
+        self.sync_selection_mode();
         self.notice = None;
     }
 
@@ -421,11 +417,7 @@ impl HistoryPage {
             .filter_map(|card| card.item.history_key())
             .collect();
         self.selected_keys = eligible.difference(&self.selected_keys).cloned().collect();
-        self.mode = if self.selected_keys.is_empty() {
-            HistoryMode::Browse
-        } else {
-            HistoryMode::Selecting
-        };
+        self.sync_selection_mode();
         self.notice = None;
     }
 
@@ -449,11 +441,7 @@ impl HistoryPage {
 
         self.selected_keys = failed.iter().map(|(key, _)| key.clone()).collect();
         let failed_count = failed.len();
-        self.mode = if failed_count == 0 {
-            HistoryMode::Browse
-        } else {
-            HistoryMode::Selecting
-        };
+        self.sync_selection_mode();
         self.selected = self.selected.min(self.items.len().saturating_sub(1));
         let total_rows = self.items.len().div_ceil(Self::COLUMNS);
         self.scroll_offset = self.scroll_offset.min(total_rows.saturating_sub(1));
@@ -543,7 +531,7 @@ impl Component for HistoryPage {
         }
         if self.mode == HistoryMode::ConfirmDelete {
             if key == KeyCode::Esc || keys.matches_back(key) {
-                self.mode = HistoryMode::Selecting;
+                self.sync_selection_mode();
                 return None;
             }
             if keys.matches_confirm(key) {
@@ -586,7 +574,7 @@ impl Component for HistoryPage {
         if key == KeyCode::Esc || keys.matches_back(key) {
             if !self.selected_keys.is_empty() {
                 self.selected_keys.clear();
-                self.mode = HistoryMode::Browse;
+                self.sync_selection_mode();
                 self.notice = None;
                 return None;
             }
@@ -902,35 +890,29 @@ impl HistoryPage {
             return;
         }
 
-        let muted = Style::default().fg(theme.fg_secondary);
-        let accent = Style::default()
-            .fg(theme.fg_accent)
-            .add_modifier(Modifier::BOLD);
-        let help = Line::from(vec![
-            Span::styled(" [", muted),
-            Span::styled(keys.get_arrow_keys_display(), accent),
-            Span::styled("/", muted),
-            Span::styled(keys.get_nav_keys_display(), accent),
-            Span::styled("] 导航  [", muted),
-            Span::styled("Space", accent),
-            Span::styled("] 选择  [", muted),
-            Span::styled("Ctrl+A/Ctrl+R", accent),
-            Span::styled("] 全选/反选  [", muted),
-            Span::styled(
-                "d",
-                Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] 删除  [", muted),
-            Span::styled(
-                &keys.confirm,
-                Style::default()
-                    .fg(theme.success)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("] 详情  [", muted),
-            Span::styled("Esc", accent),
-            Span::styled(format!("] 取消  已选 {}", self.selected_keys.len()), muted),
-        ]);
+        let help = shortcut_footer(
+            theme,
+            [
+                (
+                    format!(
+                        "{}/{}",
+                        keys.get_arrow_keys_display(),
+                        keys.get_nav_keys_display()
+                    ),
+                    "导航".into(),
+                    theme.fg_accent,
+                ),
+                ("Space".into(), "选择".into(), theme.fg_accent),
+                ("Ctrl+A/Ctrl+R".into(), "全选/反选".into(), theme.fg_accent),
+                ("d".into(), "删除".into(), theme.info),
+                (keys.confirm.clone(), "详情".into(), theme.success),
+                (
+                    "Esc".into(),
+                    format!("取消 · 已选 {}", self.selected_keys.len()),
+                    theme.fg_accent,
+                ),
+            ],
+        );
         frame.render_widget(Paragraph::new(help).alignment(Alignment::Center), area);
     }
 
