@@ -1,3 +1,8 @@
+## [1.0.13] - 2026-08-03
+
+### 🚀 Features
+
+- *(login)* Add dual QR code rendering in login UI
 ## [1.0.12] - 2026-07-14
 
 ### 🚀 Features
