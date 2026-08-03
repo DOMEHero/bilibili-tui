@@ -38,7 +38,6 @@ impl LoginPage {
     pub async fn load_qrcode(&mut self, api_client: &ApiClient) {
         match api_client.get_qrcode_data().await {
             Ok(data) => {
-                // Generate QR code image if the terminal supports it
                 self.qr_image_protocol = Self::generate_qr_image(&data.url, &self.picker);
                 self.qrcode_data = Some(data);
                 self.error_message = None;
@@ -51,20 +50,76 @@ impl LoginPage {
         }
     }
 
-    /// Generate QR code image for terminal display
     fn generate_qr_image(url: &str, picker: &Picker) -> Option<StatefulProtocol> {
         let qr_code = QrCode::new(url.as_bytes()).ok()?;
-
-        // Render QR code to an image with proper scaling
-        // Use image::Luma<u8> which implements the required trait
         let image = qr_code
             .render::<image::Luma<u8>>()
-            .min_dimensions(200, 200) // Minimum size for good scanning
-            .max_dimensions(400, 400) // Maximum size to fit in terminal
+            .min_dimensions(200, 200)
+            .max_dimensions(400, 400)
             .build();
 
         let dynamic_image = DynamicImage::ImageLuma8(image);
         Some(picker.new_resize_protocol(dynamic_image))
+    }
+
+    fn render_character_qrcode(frame: &mut Frame, area: Rect, url: &str, theme: &Theme) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border_unfocused))
+            .title(Span::styled(
+                " 字符二维码 ",
+                Style::default().fg(theme.fg_secondary),
+            ));
+
+        if let Ok(qr_code) = QrCode::new(url.as_bytes()) {
+            frame.render_widget(block.clone(), area);
+            let inner_area = block.inner(area);
+            let qr_widget = QrCodeWidget::new(qr_code)
+                .colors(Colors::Inverted)
+                .quiet_zone(QuietZone::Enabled)
+                .style(Style::default().fg(Color::Black).bg(Color::White));
+            let qr_size = qr_widget.size(inner_area);
+            let x_offset = (inner_area.width.saturating_sub(qr_size.width)) / 2;
+            let y_offset = (inner_area.height.saturating_sub(qr_size.height)) / 2;
+            let qr_area = Rect::new(
+                inner_area.x + x_offset,
+                inner_area.y + y_offset,
+                qr_size.width.min(inner_area.width),
+                qr_size.height.min(inner_area.height),
+            );
+
+            frame.render_widget(qr_widget, qr_area);
+        } else {
+            let error = Paragraph::new("❌ 二维码生成失败")
+                .style(Style::default().fg(theme.error))
+                .alignment(Alignment::Center)
+                .block(block);
+            frame.render_widget(error, area);
+        }
+    }
+
+    fn render_image_qrcode(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border_unfocused))
+            .title(Span::styled(
+                " 图片二维码 ",
+                Style::default().fg(theme.fg_secondary),
+            ));
+        frame.render_widget(block.clone(), area);
+        let inner_area = block.inner(area);
+
+        if let Some(protocol) = self.qr_image_protocol.as_mut() {
+            frame.render_stateful_widget(StatefulImage::new(), inner_area, protocol);
+        } else {
+            let fallback = Paragraph::new("当前终端不支持图片显示\n请使用左侧字符二维码登录")
+                .style(Style::default().fg(theme.fg_muted))
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(fallback, inner_area);
+        }
     }
 
     pub async fn tick(&mut self, api_client: &ApiClient) -> Option<AppAction> {
@@ -206,37 +261,14 @@ impl Component for LoginPage {
         } else if let Some(qrcode_data) = &self.qrcode_data {
             frame.render_widget(qr_block.clone(), chunks[1]);
             let inner_area = qr_block.inner(chunks[1]);
+            let qr_columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner_area);
+            let url = qrcode_data.url.clone();
 
-            // Try to render as image first (for better visual quality in supported terminals)
-            if let Some(ref mut protocol) = self.qr_image_protocol {
-                let image = StatefulImage::new();
-                frame.render_stateful_widget(image, inner_area, protocol);
-            } else if let Ok(qr_code) = QrCode::new(&qrcode_data.url) {
-                // Fallback to character-based QR code
-                // Create QR code widget with optimized settings for scanning:
-                // - Inverted colors: black modules on white background (standard QR format)
-                // - QuietZone::Enabled: white border around QR for better scanning
-                let qr_widget = QrCodeWidget::new(qr_code)
-                    .colors(Colors::Inverted)
-                    .quiet_zone(QuietZone::Enabled)
-                    .style(Style::default().fg(Color::Black).bg(Color::White));
-
-                // Get the actual size the QR code will render at
-                let qr_size = qr_widget.size(inner_area);
-
-                // Center the QR code based on its actual size
-                let x_offset = (inner_area.width.saturating_sub(qr_size.width)) / 2;
-                let y_offset = (inner_area.height.saturating_sub(qr_size.height)) / 2;
-
-                let qr_area = Rect::new(
-                    inner_area.x + x_offset,
-                    inner_area.y + y_offset,
-                    qr_size.width.min(inner_area.width),
-                    qr_size.height.min(inner_area.height),
-                );
-
-                frame.render_widget(qr_widget, qr_area);
-            }
+            Self::render_character_qrcode(frame, qr_columns[0], &url, theme);
+            self.render_image_qrcode(frame, qr_columns[1], theme);
         } else {
             let loading = Paragraph::new("⏳ 加载中...")
                 .style(
