@@ -1,6 +1,6 @@
 //! Dynamic detail page for viewing image/text dynamics
 
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::comment::CommentItem;
 use crate::api::dynamic::DynamicItem;
@@ -418,28 +418,51 @@ impl Component for DynamicDetailPage {
         } else {
             chunks[2]
         };
-        let help_text = if self.input_mode {
-            format!("[{}] 发送评论  [{}] 取消", keys.confirm, keys.back)
+        let help = if self.input_mode {
+            shortcut_footer(
+                theme,
+                [
+                    (keys.confirm.clone(), "发送评论".into(), theme.success),
+                    (keys.back.clone(), "取消".into(), theme.info),
+                ],
+            )
         } else if !self.image_urls.is_empty() {
-            format!(
-                "[{}/{}] 图片  [{}/{}] 滚动  [{}] 点赞  [{}] 评论  [n] 加载更多  [{}] 返回",
-                keys.nav_left,
-                keys.nav_right,
-                keys.nav_up,
-                keys.nav_down,
-                keys.confirm,
-                keys.comment,
-                keys.back
+            shortcut_footer(
+                theme,
+                [
+                    (
+                        format!("{}/{}", keys.nav_left, keys.nav_right),
+                        "图片".into(),
+                        theme.fg_accent,
+                    ),
+                    (
+                        format!("{}/{}", keys.nav_up, keys.nav_down),
+                        "滚动".into(),
+                        theme.fg_accent,
+                    ),
+                    (keys.confirm.clone(), "点赞".into(), theme.success),
+                    (keys.comment.clone(), "评论".into(), theme.info),
+                    ("n".into(), "加载更多".into(), theme.info),
+                    (keys.back.clone(), "返回".into(), theme.info),
+                ],
             )
         } else {
-            format!(
-                "[{}/{}] 滚动  [{}] 点赞  [{}] 评论  [n] 加载更多  [{}] 返回",
-                keys.nav_up, keys.nav_down, keys.confirm, keys.comment, keys.back
+            shortcut_footer(
+                theme,
+                [
+                    (
+                        format!("{}/{}", keys.nav_up, keys.nav_down),
+                        "滚动".into(),
+                        theme.fg_accent,
+                    ),
+                    (keys.confirm.clone(), "点赞".into(), theme.success),
+                    (keys.comment.clone(), "评论".into(), theme.info),
+                    ("n".into(), "加载更多".into(), theme.info),
+                    (keys.back.clone(), "返回".into(), theme.info),
+                ],
             )
         };
-        let help = Paragraph::new(help_text)
-            .style(Style::default().fg(theme.fg_secondary))
-            .alignment(Alignment::Center);
+        let help = Paragraph::new(help).alignment(Alignment::Center);
         frame.render_widget(help, help_chunk);
     }
 

@@ -1,7 +1,7 @@
 //! Bilibili API Client with cookie management and WBI signing
 
 use super::wbi;
-use crate::storage::Credentials;
+use crate::storage::{Credentials, VideoQuality};
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
@@ -524,7 +524,12 @@ impl ApiClient {
             .ok_or_else(|| anyhow::anyhow!("No data in video info response"))
     }
 
-    pub async fn get_play_url(&self, bvid: &str, cid: i64) -> Result<super::cdn::PlayUrlData> {
+    pub async fn get_play_url(
+        &self,
+        bvid: &str,
+        cid: i64,
+        quality: VideoQuality,
+    ) -> Result<super::cdn::PlayUrlData> {
         let url = self.build_url(BilibiliApiDomain::Main, "/x/player/wbi/playurl");
         let resp: ApiResponse<super::cdn::PlayUrlData> = self
             .get_with_wbi(
@@ -532,7 +537,7 @@ impl ApiClient {
                 vec![
                     ("bvid", bvid.to_string()),
                     ("cid", cid.to_string()),
-                    ("qn", "127".to_string()),
+                    ("qn", quality.qn().to_string()),
                     ("fnver", "0".to_string()),
                     ("fnval", "4048".to_string()),
                     ("fourk", "1".to_string()),
@@ -544,6 +549,43 @@ impl ApiClient {
         }
         resp.data
             .ok_or_else(|| anyhow!("playurl response has no data"))
+    }
+
+    pub async fn get_bangumi_play_url(
+        &self,
+        ep_id: i64,
+        quality: VideoQuality,
+    ) -> Result<super::cdn::PlayUrlData> {
+        let url = format!(
+            "{}/pgc/player/web/v2/playurl?ep_id={ep_id}&qn={}&otype=json&fnval=4048&fourk=1&from_client=BROWSER&is_main_page=false&need_fragment=false&isGaiaAvoided=true&web_location=1315873",
+            BilibiliApiDomain::Main.as_str(),
+            quality.qn()
+        );
+        let value = self.get_json(&url).await?;
+        Self::parse_bangumi_play_url(&value)
+    }
+
+    fn parse_bangumi_play_url(value: &serde_json::Value) -> Result<super::cdn::PlayUrlData> {
+        let mut payload = value;
+        if payload.get("code").is_some() {
+            Self::check_code(payload)?;
+        }
+        if let Some(raw) = payload.get("raw") {
+            payload = raw;
+        }
+        if let Some(data) = payload.get("data") {
+            payload = data;
+            if payload.get("code").is_some() {
+                Self::check_code(payload)?;
+            }
+        }
+        if let Some(result) = payload.get("result") {
+            payload = result;
+        }
+        if let Some(video_info) = payload.get("video_info") {
+            payload = video_info;
+        }
+        serde_json::from_value(payload.clone()).context("invalid bangumi playurl response")
     }
 
     pub async fn get_video_danmaku(&self, cid: i64) -> Result<Vec<super::danmaku::VideoDanmaku>> {
@@ -1090,6 +1132,23 @@ impl ApiClient {
             .ok_or_else(|| anyhow::anyhow!("No data in history response"))
     }
 
+    pub async fn delete_history_item(&self, key: &super::history::HistoryKey) -> Result<()> {
+        let url = self.build_url(BilibiliApiDomain::Main, "/x/v2/history/delete");
+        let _: ApiResponse<serde_json::Value> =
+            self.post(&url, vec![("kid", key.api_value())]).await?;
+        Ok(())
+    }
+
+    pub async fn get_article(&self, cvid: i64) -> Result<super::article::ArticleData> {
+        let url = format!(
+            "{}/x/article/view?id={cvid}",
+            BilibiliApiDomain::Main.as_str()
+        );
+        let resp: ApiResponse<super::article::ArticleData> = self.get(&url).await?;
+        resp.data
+            .ok_or_else(|| anyhow!("article response has no data"))
+    }
+
     // ========== Comment Action APIs ==========
 
     /// Add a comment (发表评论)
@@ -1480,6 +1539,27 @@ impl Default for ApiClient {
 mod live_contract_tests {
     use super::ApiClient;
     use crate::api::space::SpaceVideoOrder;
+    use crate::storage::VideoQuality;
+
+    #[test]
+    fn bangumi_v2_playurl_extracts_nested_video_info() {
+        let value = serde_json::json!({
+            "code": 0,
+            "result": {
+                "video_info": {
+                    "dash": {
+                        "video": [{"id": 80, "bandwidth": 10}],
+                        "audio": [{"id": 30280, "bandwidth": 5}],
+                        "dolby": null,
+                        "flac": null
+                    }
+                },
+                "play_view_business_info": {"episode_info": {"cid": 1}}
+            }
+        });
+        let playurl = ApiClient::parse_bangumi_play_url(&value).unwrap();
+        assert_eq!(playurl.dash.video[0].id, 80);
+    }
 
     #[tokio::test]
     #[ignore = "requires a logged-in account and network access"]
@@ -1520,8 +1600,11 @@ mod live_contract_tests {
                 .find_map(|media| media.bvid.as_deref())
             {
                 let info = client.get_video_info(bvid).await.expect("video info");
-                let play_url = client.get_play_url(bvid, info.cid).await.expect("playurl");
-                crate::api::cdn::rank_streams(&play_url)
+                let play_url = client
+                    .get_play_url(bvid, info.cid, VideoQuality::Best)
+                    .await
+                    .expect("playurl");
+                crate::api::cdn::rank_streams(&play_url, VideoQuality::Best)
                     .await
                     .expect("reachable CDN streams");
             }

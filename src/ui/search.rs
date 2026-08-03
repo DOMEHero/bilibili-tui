@@ -1,7 +1,7 @@
 //! Search page with video card grid display
 
 use super::video_card::{VideoCard, VideoCardGrid};
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::client::ApiClient;
 use crate::api::search::{HotwordItem, SearchVideoItem};
 use crate::application::AppAction;
@@ -370,26 +370,40 @@ impl Component for SearchPage {
         }
 
         // Help
-        let help_text = if self.input_mode {
-            format!(
-                "[{}] 搜索  [{}] 取消  [{}] 导航",
-                keys.confirm, keys.back, keys.nav_next_page
+        let help = if self.input_mode {
+            shortcut_footer(
+                theme,
+                [
+                    (keys.confirm.clone(), "搜索".into(), theme.success),
+                    (keys.back.clone(), "取消".into(), theme.info),
+                    (keys.nav_next_page.clone(), "导航".into(), theme.fg_accent),
+                ],
             )
         } else {
-            format!(
-                "[{}/{}] 导航  [{}/{}] 翻页  [{}] 详情  [{}] 搜索  [{}] 切换",
-                keys.get_arrow_keys_display(),
-                keys.get_nav_keys_display(),
-                keys.page_up,
-                keys.page_down,
-                keys.confirm,
-                keys.search_focus,
-                keys.nav_next_page
+            shortcut_footer(
+                theme,
+                [
+                    (
+                        format!(
+                            "{}/{}",
+                            keys.get_arrow_keys_display(),
+                            keys.get_nav_keys_display()
+                        ),
+                        "导航".into(),
+                        theme.fg_accent,
+                    ),
+                    (
+                        format!("{}/{}", keys.page_up, keys.page_down),
+                        "翻页".into(),
+                        theme.fg_accent,
+                    ),
+                    (keys.confirm.clone(), "详情".into(), theme.success),
+                    (keys.search_focus.clone(), "搜索".into(), theme.info),
+                    (keys.nav_next_page.clone(), "切换".into(), theme.info),
+                ],
             )
         };
-        let help = Paragraph::new(help_text)
-            .style(Style::default().fg(theme.fg_secondary))
-            .alignment(Alignment::Center);
+        let help = Paragraph::new(help).alignment(Alignment::Center);
         frame.render_widget(help, chunks[2]);
     }
 

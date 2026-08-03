@@ -1,6 +1,6 @@
 //! Bangumi detail page showing season info and episode list
 
-use super::{Component, Theme};
+use super::{Component, Theme, shortcut_footer};
 use crate::api::bangumi::{BangumiEpisode, SeasonResult};
 use crate::api::client::ApiClient;
 use crate::application::AppAction;
@@ -19,6 +19,8 @@ pub struct BangumiDetailPage {
     pub error_message: Option<String>,
     pub episode_scroll: usize,
     pub selected_episode: usize,
+    target_episode_id: Option<i64>,
+    pub auto_play_pending: bool,
     // Flat list of all episodes for navigation
     flat_episodes: Vec<FlatEpisode>,
     last_click_time: Option<Instant>,
@@ -41,10 +43,19 @@ impl BangumiDetailPage {
             error_message: None,
             episode_scroll: 0,
             selected_episode: 0,
+            target_episode_id: None,
+            auto_play_pending: false,
             flat_episodes: Vec::new(),
             last_click_time: None,
             last_click_index: None,
         }
+    }
+
+    pub fn new_for_episode(season_id: i64, ep_id: i64, auto_play: bool) -> Self {
+        let mut page = Self::new(season_id);
+        page.target_episode_id = Some(ep_id);
+        page.auto_play_pending = auto_play;
+        page
     }
 
     pub fn set_season(&mut self, season: SeasonResult) {
@@ -61,8 +72,18 @@ impl BangumiDetailPage {
         self.season = Some(season);
         self.loading = false;
         self.error_message = None;
-        self.selected_episode = 0;
+        let target_index = self.target_episode_id.and_then(|ep_id| {
+            self.flat_episodes
+                .iter()
+                .position(|episode| episode.episode.id == ep_id)
+        });
+        self.selected_episode = target_index.unwrap_or(0);
+        if self.target_episode_id.is_some() && target_index.is_none() {
+            self.auto_play_pending = false;
+            self.error_message = Some("未找到历史记录对应的番剧剧集".to_string());
+        }
         self.episode_scroll = 0;
+        self.update_scroll();
     }
 
     pub fn set_error(&mut self, msg: String) {
@@ -87,6 +108,10 @@ impl BangumiDetailPage {
                 season_id: self.season_id,
                 title: fe.episode.display_title(),
             })
+    }
+
+    pub fn play_action(&self) -> Option<AppAction> {
+        self.selected_action()
     }
 
     fn move_down(&mut self) {
@@ -322,13 +347,19 @@ impl Component for BangumiDetailPage {
         self.render_episodes(frame, chunks[1], theme);
 
         // Help
-        let help_text = format!(
-            "[{}/{}] 滚动 [{}] 播放 [{}] 返回",
-            keys.nav_up, keys.nav_down, keys.confirm, keys.back
-        );
-        let help = Paragraph::new(help_text)
-            .style(Style::default().fg(theme.fg_secondary))
-            .alignment(Alignment::Center);
+        let help = Paragraph::new(shortcut_footer(
+            theme,
+            [
+                (
+                    format!("{}/{}", keys.nav_up, keys.nav_down),
+                    "滚动".into(),
+                    theme.fg_accent,
+                ),
+                (keys.confirm.clone(), "播放".into(), theme.success),
+                (keys.back.clone(), "返回".into(), theme.info),
+            ],
+        ))
+        .alignment(Alignment::Center);
         frame.render_widget(help, chunks[2]);
     }
 
@@ -422,5 +453,42 @@ impl Component for BangumiDetailPage {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_episode_is_preselected_for_auto_play() {
+        let season: SeasonResult = serde_json::from_value(serde_json::json!({
+            "title": "season",
+            "season_id": 7,
+            "cover": "",
+            "square_cover": "",
+            "evaluate": null,
+            "link": null,
+            "episodes": [
+                {"aid": 1, "cid": 11, "id": 101, "title": "1"},
+                {"aid": 2, "cid": 22, "id": 202, "title": "2"}
+            ],
+            "section": null,
+            "rating": null,
+            "stat": null,
+            "badge": null,
+            "is_finish": null,
+            "index_show": null
+        }))
+        .unwrap();
+        let mut page = BangumiDetailPage::new_for_episode(7, 202, true);
+        page.set_season(season);
+
+        assert_eq!(page.selected_episode, 1);
+        assert!(page.auto_play_pending);
+        assert!(matches!(
+            page.play_action(),
+            Some(AppAction::PlayBangumiEpisode { ep_id: 202, .. })
+        ));
     }
 }

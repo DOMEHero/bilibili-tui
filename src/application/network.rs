@@ -1,15 +1,15 @@
 use crate::api::{
     ApiClient,
+    article::ArticleData,
     bangumi::{SeasonRankItem, SeasonResult},
-    comment::CommentItem,
+    comment::{CommentItem, CommentType},
     dynamic::DynamicItem,
     dynamic::UpListItem,
     favorite::{
         CollectedFolder, FavoriteFolder, FavoriteOrder, FavoriteResourceData, FavoriteSource,
         SeasonArchivesData, WatchLaterData,
     },
-    history::HistoryCursor,
-    history::HistoryData,
+    history::{HistoryCursor, HistoryData, HistoryKey},
     live::LiveRoom,
     recommend::{HomeFeed, VideoItem},
     search::HotwordItem,
@@ -68,6 +68,14 @@ pub enum NetworkCommand {
     LoadHistoryMore {
         req_id: u64,
         cursor: HistoryCursor,
+    },
+    DeleteHistory {
+        req_id: u64,
+        keys: Vec<HistoryKey>,
+    },
+    LoadArticle {
+        req_id: u64,
+        cvid: i64,
     },
     LoadLiveInit {
         req_id: u64,
@@ -170,6 +178,17 @@ pub enum NetworkEvent {
         req_id: u64,
         append: bool,
         data: HistoryData,
+    },
+    HistoryDeleted {
+        req_id: u64,
+        successful: Vec<HistoryKey>,
+        failed: Vec<(HistoryKey, String)>,
+    },
+    ArticleLoaded {
+        req_id: u64,
+        cvid: i64,
+        article: ArticleData,
+        comments: Vec<CommentItem>,
     },
     LiveLoaded {
         req_id: u64,
@@ -332,6 +351,8 @@ impl NetworkCommand {
             | Self::LoadDynamicRefresh { .. }
             | Self::LoadDynamicMore { .. } => "dynamic",
             Self::LoadHistoryInit { .. } | Self::LoadHistoryMore { .. } => "history",
+            Self::DeleteHistory { .. } => "history_delete",
+            Self::LoadArticle { .. } => "article_detail",
             Self::LoadLiveInit { .. } | Self::LoadLiveMore { .. } => "live",
             Self::LoadVideoDetail { .. } => "video_detail",
             Self::LoadUpPage { .. } | Self::LoadUpVideos { .. } => "up",
@@ -706,6 +727,50 @@ async fn handle_command(api_client: Arc<ApiClient>, command: NetworkCommand) -> 
                 data,
             },
             Err(e) => failed(req_id, "history_more", e),
+        },
+        NetworkCommand::DeleteHistory { req_id, keys } => {
+            let mut successful = Vec::new();
+            let mut failed_keys = Vec::new();
+            for key in keys {
+                match api_client.delete_history_item(&key).await {
+                    Ok(()) => successful.push(key),
+                    Err(error) => failed_keys.push((key, error.to_string())),
+                }
+            }
+            NetworkEvent::HistoryDeleted {
+                req_id,
+                successful,
+                failed: failed_keys,
+            }
+        }
+        NetworkCommand::LoadArticle { req_id, cvid } => match api_client.get_article(cvid).await {
+            Ok(article) => {
+                let comment_oid = if article.id > 0 { article.id } else { cvid };
+                let comments = api_client
+                    .get_dynamic_comments(comment_oid, CommentType::Article.as_i32(), 1)
+                    .await
+                    .ok()
+                    .map(|data| {
+                        let mut comments = data.hots.unwrap_or_default();
+                        for comment in data.replies.unwrap_or_default() {
+                            if !comments
+                                .iter()
+                                .any(|existing| existing.rpid == comment.rpid)
+                            {
+                                comments.push(comment);
+                            }
+                        }
+                        comments
+                    })
+                    .unwrap_or_default();
+                NetworkEvent::ArticleLoaded {
+                    req_id,
+                    cvid,
+                    article,
+                    comments,
+                }
+            }
+            Err(error) => failed(req_id, "article_detail", error),
         },
         NetworkCommand::LoadLiveInit { req_id } => {
             let rooms = match api_client.get_live_home_rooms().await {

@@ -1,9 +1,10 @@
 use crate::api::favorite::{FavoriteOrder, FavoriteSource};
+use crate::api::history::HistoryKey;
 use crate::api::recommend::HomeFeed;
 use crate::api::space::SpaceVideoOrder;
 use crate::api::video::VideoPage;
 use crate::domain::playback::{PlayOrder, PlaylistItem, PlaylistSource};
-use crate::infrastructure::persistence::{Credentials, DanmakuConfig, Keybindings};
+use crate::infrastructure::persistence::{Credentials, DanmakuConfig, Keybindings, VideoQuality};
 use crate::presentation::tui::DynamicTab;
 
 /// Actions that can be triggered from UI components
@@ -89,6 +90,12 @@ pub enum AppAction {
     LoadMoreDynamic,
     /// Load more history items
     LoadMoreHistory,
+    DeleteHistoryItems(Vec<HistoryKey>),
+    OpenArticle(i64),
+    OpenHistoryBangumi {
+        season_id: i64,
+        ep_id: i64,
+    },
     /// Load more comments in video detail page
     LoadMoreComments,
     /// Toggle comment replies expansion
@@ -107,6 +114,7 @@ pub enum AppAction {
     SaveDanmakuConfig(Box<DanmakuConfig>),
     /// Save the auto-play-on-video-open preference.
     SaveAutoPlay(bool),
+    SaveVideoQuality(VideoQuality),
     /// Logout and return to login page
     Logout,
     /// Like or unlike a comment (oid, rpid, comment_type)
